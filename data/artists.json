@@ -1,0 +1,110 @@
+{
+  "artists": [
+    {
+      "id": 1,
+      "name": "Luna Caribeña",
+      "genre": "Indie Pop",
+      "lat": 10.9639,
+      "lng": -74.7964,
+      "city": "Centro",
+      "bio": "Banda indie pop con influencias caribeñas y ritmos electrónicos",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎵"
+    },
+    {
+      "id": 2,
+      "name": "Ritmo Urbano",
+      "genre": "Hip-Hop",
+      "lat": 10.9854,
+      "lng": -74.7949,
+      "city": "Paseo de Colón",
+      "bio": "Colectivo de hip-hop con líricas de la ciudad",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎤"
+    },
+    {
+      "id": 3,
+      "name": "Tropical Indie",
+      "genre": "Indie Rock",
+      "lat": 10.9711,
+      "lng": -74.8265,
+      "city": "Botánico",
+      "bio": "Rock indie con elementos tropicales y folklóricos",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎸"
+    },
+    {
+      "id": 4,
+      "name": "Electro Caribe",
+      "genre": "Electrónica",
+      "lat": 10.9527,
+      "lng": -74.7852,
+      "city": "Sur",
+      "bio": "Productor de música electrónica experimental",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎛️"
+    },
+    {
+      "id": 5,
+      "name": "Voces del Mar",
+      "genre": "Soul/R&B",
+      "lat": 10.9828,
+      "lng": -74.7867,
+      "city": "Centro-Este",
+      "bio": "Dúo de soul y R&B con armonías suave",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎹"
+    },
+    {
+      "id": 6,
+      "name": "Folk Moderno",
+      "genre": "Folk",
+      "lat": 10.9614,
+      "lng": -74.8156,
+      "city": "Occidente",
+      "bio": "Cantautor con guitarra acústica y poesía",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎸"
+    },
+    {
+      "id": 7,
+      "name": "Fusion Barrio",
+      "genre": "Fusión",
+      "lat": 10.9833,
+      "lng": -74.7765,
+      "city": "Puerto",
+      "bio": "Banda fusión con mezcla de salsa, jazz y contemporáneo",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🎺"
+    },
+    {
+      "id": 8,
+      "name": "Beats Locales",
+      "genre": "Trap/Reggaeton",
+      "lat": 10.9755,
+      "lng": -74.7654,
+      "city": "Playa",
+      "bio": "Productor de trap y reggaeton con identidad propia",
+      "spotifyUrl": "https://open.spotify.com",
+      "soundcloudUrl": "https://soundcloud.com",
+      "imageUrl": "🥁"
+    }
+  ],
+  "genres": [
+    "Indie Pop",
+    "Hip-Hop",
+    "Indie Rock",
+    "Electrónica",
+    "Soul/R&B",
+    "Folk",
+    "Fusión",
+    "Trap/Reggaeton"
+  ]
+}

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alvaro & Kaylie por el mundo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-shell">
+        <main class="layout">
+            <section class="map-stage">
+                <div class="map-card">
+                    <div id="map"></div>
+                    <div class="draft-crosshair" id="draftCrosshair" aria-hidden="true" hidden>
+                        <span class="draft-crosshair-line draft-crosshair-x" id="draftCrosshairX"></span>
+                        <span class="draft-crosshair-line draft-crosshair-y" id="draftCrosshairY"></span>
+                    </div>
+                    <div class="spot-modal-overlay" id="spotModalOverlay" hidden>
+                        <div class="spot-modal" role="dialog" aria-modal="true" aria-labelledby="spotModalTitle">
+                            <p class="spot-modal-kicker">Nueva entrada</p>
+                            <h2 id="spotModalTitle">Como se llama este spot?</h2>
+                            <form class="spot-modal-form" id="spotModalForm">
+                                <label class="spot-modal-label" for="spotNameInput">Nombre del lugar</label>
+                                <input
+                                    class="spot-modal-input"
+                                    id="spotNameInput"
+                                    name="spot_name"
+                                    type="text"
+                                    maxlength="80"
+                                    placeholder="Ej. Cafe frente al rio"
+                                    autocomplete="off"
+                                    required
+                                >
+                                <div class="spot-modal-actions">
+                                    <button class="ghost-btn" id="spotModalCancel" type="button">Cancelar</button>
+                                    <button class="primary-btn" type="submit">Guardar spot</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                    <div class="spot-modal-overlay" id="confirmModalOverlay" hidden>
+                        <div class="spot-modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+                            <p class="spot-modal-kicker">Confirmacion</p>
+                            <h2 id="confirmModalTitle">Eliminar spot?</h2>
+                            <p class="confirm-modal-copy" id="confirmModalCopy"></p>
+                            <div class="spot-modal-actions">
+                                <button class="ghost-btn" id="confirmModalCancel" type="button">Cancelar</button>
+                                <button class="primary-btn confirm-modal-danger" id="confirmModalAccept" type="button">Eliminar</button>
+                            </div>
+                        </div>
+                    </div>
+                    <button
+                        class="draft-marker-launcher"
+                        id="draftMarkerLauncher"
+                        type="button"
+                        aria-label="Agregar nueva entrada en el mapa"
+                        title="Mantener presionado, mover y soltar para ubicar la nueva entrada"
+                    >
+                        <span class="draft-marker-pin" aria-hidden="true"></span>
+                    </button>
+                </div>
+            </section>
+
+            <section class="forum-pane">
+                <header class="topbar forum-topbar">
+                    <a href="#" class="forum-brand" aria-label="Alvaro y Kaylie por el mundo - Inicio">
+                        <span class="brand-icon" aria-hidden="true">♥</span>
+                        <div class="brand-text">
+                            <strong>Alvaro & Kaylie por el mundo</strong>
+                        </div>
+                    </a>
+                    <nav class="forum-nav" aria-label="Navegacion del blog">
+                        <div class="nav-track">
+                            <a class="nav-link active" href="#">Inicio</a>
+                            <a class="nav-link" href="#">Cronicas</a>
+                            <a class="nav-link" href="#">Lugares</a>
+                            <a class="nav-link" href="#">Recorridos</a>
+                            <a class="nav-link" href="#">Archivo</a>
+                        </div>
+                    </nav>
+                    <div class="forum-actions">
+                        <button class="primary-btn login-btn" id="loginLauncher" type="button" aria-label="Iniciar sesión">
+                            <svg class="login-key-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <circle cx="8" cy="12" r="3.25" fill="none" stroke="currentColor" stroke-width="2"></circle>
+                                <path d="M11 12h9M16 12v3M19 12v2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </header>
+
+                <section class="hero-quote" aria-label="Dedicación">
+                    <p class="hero-quote-text">Construí este espacio solo para dejar constancia siempre de que nuestro amor existió y fue tan grande que recorrió el mundo entero.</p>
+                </section>
+
+                <section class="home-entries-section" aria-label="Entradas recientes">
+                    <div class="home-entries-head">
+                        <h3>Entradas recientes</h3>
+                        <span id="homeEntriesCount">0 publicadas</span>
+                    </div>
+                    <div class="home-entries-feed" id="homeEntriesFeed"></div>
+                </section>
+
+                <div class="forum-grid">
+                    <aside class="right-rail">
+                        <section class="feed-panel">
+                            <div class="feed-content" id="feedContent"></div>
+                        </section>
+                    </aside>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div class="auth-modal-overlay" id="authModalOverlay" hidden>
+        <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+            <p class="spot-modal-kicker">Acceso</p>
+            <h2 id="authModalTitle">Inicia sesión</h2>
+            <form class="auth-modal-form" id="authModalForm">
+                <label class="spot-modal-label" for="authEmailInput">Correo</label>
+                <input class="spot-modal-input" id="authEmailInput" name="email" type="email" autocomplete="email" required>
+                <label class="spot-modal-label" for="authPasswordInput">Contraseña</label>
+                <div class="auth-password-field">
+                    <input class="spot-modal-input auth-password-input" id="authPasswordInput" name="password" type="password" autocomplete="current-password" required>
+                    <button class="ghost-btn auth-password-toggle" id="toggleAuthPassword" type="button" aria-label="Mostrar contraseña" aria-pressed="false">Ver</button>
+                </div>
+                <div class="spot-modal-actions">
+                    <button class="ghost-btn" id="authModalCancel" type="button">Cancelar</button>
+                    <button class="primary-btn" type="submit">Entrar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+    <script type="module" src="map.js"></script>
+</body>
+</html>

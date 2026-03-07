@@ -1,22 +1,22 @@
 {
-  "name": "mi-mapa-barranquilla",
+  "name": "mapa-barranquilla",
   "version": "1.0.0",
-  "main": "index.ts",
+  "description": "Mapa interactivo de Barranquilla con tema dark y alto contraste",
+  "main": "index.js",
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "start": "python -m http.server 8000",
+    "dev": "python -m http.server 8000"
   },
+  "keywords": [
+    "mapa",
+    "barranquilla",
+    "leaflet",
+    "open-source"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "expo": "~55.0.2",
-    "expo-status-bar": "~55.0.4",
-    "react": "19.2.0",
-    "react-native": "0.83.2"
-  },
-  "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~5.9.2"
-  },
-  "private": true
+    "firebase": "^12.10.0",
+    "leaflet": "^1.9.4"
+  }
 }
