@@ -16,7 +16,11 @@ const CATEGORY_META = {
 const threads = [];
 const SUPABASE_TABLES = {
     spots: 'map_spots',
-    entries: 'map_entries'
+    entries: 'map_entries',
+    photos: 'map_photos'
+};
+const SUPABASE_STORAGE = {
+    galleryBucket: 'map-gallery'
 };
 const MANUAL_AUTH_USERS = {
     Kaylie: 'kaylie123',
@@ -39,9 +43,12 @@ let pendingConfirmAction = null;
 let activeComposerContext = null;
 let activeGalleryContext = null;
 let activeReadEntryId = null;
+let activeGlobalGalleryMode = false;
 let currentManualUser = null;
+let masonryResizeTimer = null;
 const entryDraftsBySpot = new Map();
 const galleryPhotosBySpot = new Map();
+const globalGalleryPhotos = [];
 const publishedEntries = [];
 let nextLocalEntryId = 1;
 
@@ -125,6 +132,174 @@ function mapEntryRecordToViewModel(entryRecord, fallback = {}) {
     };
 }
 
+function getPhotoPublicUrl(filePath) {
+    if (!isBackendReady() || !filePath) {
+        return '';
+    }
+
+    const { data } = supabase.storage
+        .from(SUPABASE_STORAGE.galleryBucket)
+        .getPublicUrl(filePath);
+    return data && data.publicUrl ? data.publicUrl : '';
+}
+
+function mapPhotoRecordToViewModel(photoRecord, fallback = {}) {
+    const filePath = photoRecord.file_path || fallback.storagePath || '';
+    const createdAt = photoRecord.created_at || fallback.createdAt || new Date().toISOString();
+    const spotKey = photoRecord.spot_id || fallback.spotKey || null;
+    const scope = photoRecord.scope || fallback.scope || (spotKey ? 'spot' : 'global');
+
+    return {
+        id: String(photoRecord.id || fallback.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+        scope,
+        spotKey: spotKey ? String(spotKey) : null,
+        src: fallback.src || getPhotoPublicUrl(filePath),
+        name: photoRecord.file_name || fallback.name || 'Foto',
+        description: photoRecord.description || fallback.description || '',
+        addedBy: photoRecord.uploaded_by || fallback.addedBy || '',
+        addedAt: fallback.addedAt || formatEntryDate(createdAt),
+        createdAt,
+        storagePath: filePath,
+        persisted: Boolean(photoRecord.id)
+    };
+}
+
+function sanitizePathPart(value) {
+    return String(value || 'unknown')
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '') || 'unknown';
+}
+
+function getFileExtension(fileName) {
+    const parts = String(fileName || '').split('.');
+    return parts.length > 1 ? parts.pop().toLowerCase() : 'jpg';
+}
+
+async function uploadGalleryFiles(files, context = {}) {
+    const { scope = 'global', spotKey = null } = context;
+    const uploadedItems = [];
+    const canPersistInBackend =
+        isBackendReady() &&
+        (scope === 'global' || isPersistedSpot(String(spotKey || '')));
+
+    for (const file of files) {
+        const localFallback = await readFileAsLocalPhoto(file, context);
+        if (!localFallback) {
+            continue;
+        }
+
+        if (!canPersistInBackend) {
+            uploadedItems.push(localFallback);
+            continue;
+        }
+
+        const createdBy = currentManualUser || null;
+        const ext = getFileExtension(file.name);
+        const segment = scope === 'spot' ? sanitizePathPart(spotKey) : 'global';
+        const storagePath = `${scope}/${segment}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+
+        const { error: uploadError } = await supabase.storage
+            .from(SUPABASE_STORAGE.galleryBucket)
+            .upload(storagePath, file, { upsert: false });
+
+        if (uploadError) {
+            logSupabaseError('No se pudo subir una foto al storage', uploadError);
+            uploadedItems.push(localFallback);
+            continue;
+        }
+
+        const insertPayload = {
+            scope,
+            spot_id: scope === 'spot' ? String(spotKey || '') : null,
+            file_path: storagePath,
+            file_name: file.name,
+            description: '',
+            uploaded_by: createdBy
+        };
+
+        const { data, error: insertError } = await supabase
+            .from(SUPABASE_TABLES.photos)
+            .insert(insertPayload)
+            .select('id, scope, spot_id, file_path, file_name, description, uploaded_by, created_at')
+            .single();
+
+        if (insertError) {
+            logSupabaseError('No se pudo guardar metadata de foto', insertError);
+            uploadedItems.push({
+                ...localFallback,
+                src: getPhotoPublicUrl(storagePath) || localFallback.src,
+                storagePath,
+                persisted: false
+            });
+            continue;
+        }
+
+        uploadedItems.push(
+            mapPhotoRecordToViewModel(data, {
+                spotKey,
+                scope
+            })
+        );
+    }
+
+    return uploadedItems;
+}
+
+async function readFileAsLocalPhoto(file, context = {}) {
+    const { scope = 'global', spotKey = null } = context;
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = function(loadEvent) {
+            resolve({
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                scope,
+                spotKey,
+                src: String(loadEvent.target && loadEvent.target.result ? loadEvent.target.result : ''),
+                name: file.name,
+                description: '',
+                addedBy: currentManualUser || '',
+                addedAt: formatEntryDate(new Date().toISOString()),
+                createdAt: new Date().toISOString(),
+                storagePath: '',
+                persisted: false
+            });
+        };
+        reader.onerror = function() {
+            resolve(null);
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+async function deleteGalleryPhoto(photo) {
+    if (!photo) return false;
+
+    if (isBackendReady() && photo.persisted) {
+        const { error: rowDeleteError } = await supabase
+            .from(SUPABASE_TABLES.photos)
+            .delete()
+            .eq('id', photo.id);
+
+        if (rowDeleteError) {
+            logSupabaseError('No se pudo eliminar la foto de la base de datos', rowDeleteError);
+            return false;
+        }
+
+        if (photo.storagePath) {
+            const { error: storageDeleteError } = await supabase.storage
+                .from(SUPABASE_STORAGE.galleryBucket)
+                .remove([photo.storagePath]);
+            if (storageDeleteError) {
+                logSupabaseError('No se pudo eliminar la foto del storage', storageDeleteError);
+            }
+        }
+    }
+
+    return true;
+}
+
 function addSpotMarkerFromRecord(spotRecord) {
     const spotId = String(spotRecord.id || '');
     if (!spotId || createdSpotMarkers.has(spotId)) {
@@ -180,7 +355,41 @@ async function hydrateFromSupabase() {
     (entryRows || []).forEach((entryRecord) => {
         publishedEntries.push(mapEntryRecordToViewModel(entryRecord));
     });
+
+    const { data: photoRows, error: photosError } = await supabase
+        .from(SUPABASE_TABLES.photos)
+        .select('id, scope, spot_id, file_path, file_name, description, uploaded_by, created_at')
+        .order('created_at', { ascending: false });
+
+    if (photosError) {
+        logSupabaseError('No se pudieron cargar las fotos', photosError);
+    } else {
+        globalGalleryPhotos.length = 0;
+        galleryPhotosBySpot.clear();
+
+        (photoRows || []).forEach((photoRecord) => {
+            const photo = mapPhotoRecordToViewModel(photoRecord);
+            if (!photo.src) {
+                return;
+            }
+
+            if (photo.scope === 'global') {
+                globalGalleryPhotos.push(photo);
+                return;
+            }
+
+            const spotKey = String(photo.spotKey || '');
+            if (!spotKey) {
+                return;
+            }
+            const existing = galleryPhotosBySpot.get(spotKey) || [];
+            existing.push(photo);
+            galleryPhotosBySpot.set(spotKey, existing);
+        });
+    }
+
     renderHomeEntriesFeed();
+    renderThreads();
 }
 
 function isPersistedSpot(spotId) {
@@ -215,6 +424,8 @@ function bindStaticUi() {
     const authModalCancel = document.getElementById('authModalCancel');
     const authModalForm = document.getElementById('authModalForm');
     const toggleAuthPassword = document.getElementById('toggleAuthPassword');
+    const navHomeLink = document.getElementById('navHomeLink');
+    const navGalleryLink = document.getElementById('navGalleryLink');
 
     map.on('mousemove', function(event) {
         if (!isDraftPlacementMode || !event.containerPoint) return;
@@ -298,6 +509,30 @@ function bindStaticUi() {
 
     if (toggleAuthPassword) {
         toggleAuthPassword.addEventListener('click', toggleAuthPasswordVisibility);
+    }
+
+    window.addEventListener('resize', handleMasonryResize);
+
+    if (navHomeLink) {
+        navHomeLink.addEventListener('click', function(event) {
+            event.preventDefault();
+            activeGlobalGalleryMode = false;
+            activeComposerContext = null;
+            activeGalleryContext = null;
+            activeReadEntryId = null;
+            setNavMode('home');
+            renderThreads();
+        });
+    }
+
+    if (navGalleryLink) {
+        navGalleryLink.addEventListener('click', function(event) {
+            event.preventDefault();
+            if (!ensureManualAuth('abrir la galería')) {
+                return;
+            }
+            openGlobalGalleryPane();
+        });
     }
 
     document.addEventListener('click', function(event) {
@@ -992,18 +1227,37 @@ async function handleAuthModalSubmit(event) {
 
 function updateLoginButtonState() {
     const loginLauncher = document.getElementById('loginLauncher');
+    const galleryLink = document.getElementById('navGalleryLink');
     if (!loginLauncher) return;
 
     if (currentManualUser) {
         loginLauncher.setAttribute('title', `Sesion iniciada: ${currentManualUser}`);
         loginLauncher.setAttribute('aria-label', `Sesion iniciada: ${currentManualUser}`);
         loginLauncher.classList.add('is-authenticated');
+        if (galleryLink) {
+            galleryLink.classList.remove('locked');
+            galleryLink.setAttribute('aria-disabled', 'false');
+            galleryLink.removeAttribute('title');
+        }
     } else {
         loginLauncher.setAttribute('title', 'Iniciar sesion');
         loginLauncher.setAttribute('aria-label', 'Iniciar sesion');
         loginLauncher.classList.remove('is-authenticated');
+        if (galleryLink) {
+            galleryLink.classList.add('locked');
+            galleryLink.setAttribute('aria-disabled', 'true');
+            galleryLink.setAttribute('title', 'Inicia sesión para abrir la galería');
+        }
+        if (activeGlobalGalleryMode) {
+            activeGlobalGalleryMode = false;
+        }
     }
 
+    if (!activeGlobalGalleryMode) {
+        setNavMode('home');
+    } else {
+        setNavMode('gallery');
+    }
     renderThreads();
 }
 
@@ -1052,6 +1306,7 @@ function renderThreads() {
         document.body.classList.add('compose-mode');
         document.body.classList.remove('gallery-mode');
         document.body.classList.remove('read-mode');
+        document.body.classList.remove('global-gallery-mode');
         renderEntryComposer(feedContent, activeComposerContext);
         return;
     }
@@ -1060,7 +1315,17 @@ function renderThreads() {
         document.body.classList.remove('compose-mode');
         document.body.classList.add('gallery-mode');
         document.body.classList.remove('read-mode');
+        document.body.classList.remove('global-gallery-mode');
         renderGalleryPane(feedContent, activeGalleryContext);
+        return;
+    }
+
+    if (activeGlobalGalleryMode) {
+        document.body.classList.remove('compose-mode');
+        document.body.classList.remove('gallery-mode');
+        document.body.classList.remove('read-mode');
+        document.body.classList.add('global-gallery-mode');
+        renderGlobalGalleryPane(feedContent);
         return;
     }
 
@@ -1068,6 +1333,7 @@ function renderThreads() {
         document.body.classList.remove('compose-mode');
         document.body.classList.remove('gallery-mode');
         document.body.classList.add('read-mode');
+        document.body.classList.remove('global-gallery-mode');
         renderEntryReaderPane(feedContent, activeReadEntryId);
         return;
     }
@@ -1075,6 +1341,7 @@ function renderThreads() {
     document.body.classList.remove('compose-mode');
     document.body.classList.remove('gallery-mode');
     document.body.classList.remove('read-mode');
+    document.body.classList.remove('global-gallery-mode');
 
     if (feedCount) feedCount.textContent = `${threads.length} publicadas`;
     feedContent.innerHTML = threads
@@ -1117,9 +1384,11 @@ function openEntryComposer(context) {
     activeComposerContext = context;
     activeGalleryContext = null;
     activeReadEntryId = null;
+    activeGlobalGalleryMode = false;
     document.body.classList.add('compose-mode');
     document.body.classList.remove('gallery-mode');
     document.body.classList.remove('read-mode');
+    setNavMode('home');
     renderThreads();
 
     const feedContent = document.getElementById('feedContent');
@@ -1145,9 +1414,11 @@ function openGalleryPane(context) {
     };
     activeComposerContext = null;
     activeReadEntryId = null;
+    activeGlobalGalleryMode = false;
     document.body.classList.remove('compose-mode');
     document.body.classList.add('gallery-mode');
     document.body.classList.remove('read-mode');
+    setNavMode('home');
     renderThreads();
 
     const feedContent = document.getElementById('feedContent');
@@ -1166,9 +1437,11 @@ function openEntryReader(entryId) {
     activeReadEntryId = String(entryId);
     activeComposerContext = null;
     activeGalleryContext = null;
+    activeGlobalGalleryMode = false;
     document.body.classList.remove('compose-mode');
     document.body.classList.remove('gallery-mode');
     document.body.classList.add('read-mode');
+    setNavMode('home');
     renderThreads();
 
     const entry = publishedEntries.find((item) => String(item.id) === activeReadEntryId);
@@ -1186,6 +1459,240 @@ function closeEntryReader() {
     activeReadEntryId = null;
     document.body.classList.remove('read-mode');
     renderThreads();
+}
+
+function openGlobalGalleryPane() {
+    activeGlobalGalleryMode = true;
+    activeComposerContext = null;
+    activeGalleryContext = null;
+    activeReadEntryId = null;
+    document.body.classList.remove('compose-mode');
+    document.body.classList.remove('gallery-mode');
+    document.body.classList.remove('read-mode');
+    setNavMode('gallery');
+    renderThreads();
+}
+
+function renderGlobalGalleryPane(feedContent) {
+    const canUpload = isManualAuthenticated();
+
+    feedContent.innerHTML = `
+        <section class="gallery-panel global-gallery-panel" aria-label="Galería general">
+            <header class="gallery-head">
+                <div>
+                    <p class="gallery-kicker">Galería</p>
+                    <p class="gallery-count">${globalGalleryPhotos.length} foto${globalGalleryPhotos.length === 1 ? '' : 's'}</p>
+                </div>
+                <div class="gallery-head-actions">
+                    <button class="primary-btn" type="button" id="addGlobalGalleryPhotoBtn" ${canUpload ? '' : 'disabled'} title="${canUpload ? 'Agregar fotos' : 'Inicia sesión para agregar fotos'}">Agregar fotos</button>
+                    <input id="globalGalleryPhotoInput" type="file" accept="image/*" multiple hidden>
+                </div>
+            </header>
+
+            <div class="gallery-feed gallery-view-pinterest">
+                ${globalGalleryPhotos.length
+                    ? globalGalleryPhotos.map((photo) => `
+                        <article class="gallery-item" data-global-photo-id="${photo.id}">
+                            <img src="${photo.src}" alt="${escapeHtml(photo.name || 'Foto de galería')}">
+                            <div class="gallery-item-meta">
+                                <strong>${escapeHtml(photo.name || 'Foto')}</strong>
+                                ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
+                                <span>${escapeHtml(photo.addedAt || '')}</span>
+                            </div>
+                            ${canUpload ? `
+                                <div class="gallery-item-controls">
+                                    <button type="button" class="gallery-edit-btn" data-edit-global-photo="${photo.id}">Editar</button>
+                                    <button type="button" class="gallery-remove-btn" data-remove-global-photo="${photo.id}">Eliminar</button>
+                                </div>
+                            ` : ''}
+                        </article>
+                    `).join('')
+                    : `
+                        <div class="gallery-empty">
+                            <h4>No hay fotos aún</h4>
+                            <p>Publica fotos para construir el muro tipo Pinterest.</p>
+                        </div>
+                    `
+                }
+            </div>
+        </section>
+    `;
+
+    bindGlobalGalleryPaneUi();
+    scheduleMasonryLayout(feedContent);
+}
+
+function bindGlobalGalleryPaneUi() {
+    const addBtn = document.getElementById('addGlobalGalleryPhotoBtn');
+    const input = document.getElementById('globalGalleryPhotoInput');
+
+    if (addBtn && input) {
+        addBtn.addEventListener('click', function() {
+            if (!ensureManualAuth('agregar fotos')) {
+                return;
+            }
+            input.click();
+        });
+    }
+
+    if (input) {
+        input.addEventListener('change', function(event) {
+            const files = Array.from(event.target.files || []);
+            if (!files.length) return;
+            appendPhotosToGlobalGallery(files);
+            input.value = '';
+        });
+    }
+
+    document.querySelectorAll('[data-edit-global-photo]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('editar fotos')) {
+                return;
+            }
+            const photoId = button.dataset.editGlobalPhoto;
+            editGlobalGalleryPhoto(photoId);
+        });
+    });
+
+    document.querySelectorAll('[data-remove-global-photo]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('eliminar fotos')) {
+                return;
+            }
+            const photoId = button.dataset.removeGlobalPhoto;
+            removeGlobalGalleryPhoto(photoId);
+        });
+    });
+}
+
+function appendPhotosToGlobalGallery(files) {
+    if (!ensureManualAuth('agregar fotos')) {
+        return;
+    }
+
+    void uploadGalleryFiles(files, { scope: 'global', spotKey: null }).then((items) => {
+        if (!items.length) return;
+        globalGalleryPhotos.unshift(...items);
+        renderThreads();
+    });
+}
+
+function promptPhotoEdition(photo) {
+    if (!photo) return null;
+
+    const nextNameInput = window.prompt('Nombre de la foto', String(photo.name || ''));
+    if (nextNameInput === null) return null;
+
+    const nextDescriptionInput = window.prompt('Descripcion de la foto', String(photo.description || ''));
+    if (nextDescriptionInput === null) return null;
+
+    return {
+        name: nextNameInput.trim() || 'Foto',
+        description: nextDescriptionInput.trim()
+    };
+}
+
+function confirmPhotoDeletion(photoName) {
+    const safeName = photoName ? `"${photoName}"` : 'esta foto';
+    window.alert(`Vas a eliminar ${safeName}.`);
+    return window.confirm(`Seguro que deseas eliminar ${safeName}? Esta accion no se puede deshacer.`);
+}
+
+function editGlobalGalleryPhoto(photoId) {
+    if (!photoId) return;
+
+    const index = globalGalleryPhotos.findIndex((photo) => String(photo.id) === String(photoId));
+    if (index < 0) return;
+
+    const edited = promptPhotoEdition(globalGalleryPhotos[index]);
+    if (!edited) return;
+
+    globalGalleryPhotos[index] = {
+        ...globalGalleryPhotos[index],
+        ...edited
+    };
+    const current = globalGalleryPhotos[index];
+    if (isBackendReady() && current.persisted) {
+        void supabase
+            .from(SUPABASE_TABLES.photos)
+            .update({
+                file_name: current.name,
+                description: current.description
+            })
+            .eq('id', current.id)
+            .then(({ error }) => {
+                if (error) {
+                    logSupabaseError('No se pudo editar metadata de la foto', error);
+                }
+            });
+    }
+    renderThreads();
+}
+
+function removeGlobalGalleryPhoto(photoId) {
+    if (!photoId) return;
+    const target = globalGalleryPhotos.find((photo) => String(photo.id) === String(photoId));
+    if (!confirmPhotoDeletion(target ? target.name : '')) {
+        return;
+    }
+    void deleteGalleryPhoto(target).then((deleted) => {
+        if (!deleted) return;
+        const next = globalGalleryPhotos.filter((photo) => String(photo.id) !== String(photoId));
+        globalGalleryPhotos.length = 0;
+        globalGalleryPhotos.push(...next);
+        renderThreads();
+    });
+}
+
+function scheduleMasonryLayout(root) {
+    window.requestAnimationFrame(() => {
+        applyMasonryLayout(root);
+        bindMasonryImageEvents(root);
+    });
+}
+
+function bindMasonryImageEvents(root) {
+    if (!root) return;
+    const images = root.querySelectorAll('.gallery-view-pinterest img');
+    images.forEach((image) => {
+        if (image.complete) return;
+        image.addEventListener('load', () => applyMasonryLayout(root), { once: true });
+        image.addEventListener('error', () => applyMasonryLayout(root), { once: true });
+    });
+}
+
+function applyMasonryLayout(root = document) {
+    const feeds = root.querySelectorAll('.gallery-view-pinterest');
+    feeds.forEach((feed) => {
+        const style = window.getComputedStyle(feed);
+        const rowHeight = parseFloat(style.getPropertyValue('--masonry-row-height')) || 8;
+        const rowGap = parseFloat(style.rowGap || style.gap) || 12;
+
+        const items = feed.querySelectorAll('.gallery-item');
+        items.forEach((item) => {
+            item.style.gridRowEnd = 'auto';
+            const itemHeight = item.getBoundingClientRect().height;
+            const span = Math.max(1, Math.ceil((itemHeight + rowGap) / (rowHeight + rowGap)));
+            item.style.gridRowEnd = `span ${span}`;
+        });
+    });
+}
+
+function handleMasonryResize() {
+    if (masonryResizeTimer) {
+        window.clearTimeout(masonryResizeTimer);
+    }
+
+    masonryResizeTimer = window.setTimeout(() => {
+        applyMasonryLayout(document);
+    }, 90);
+}
+
+function setNavMode(mode) {
+    const home = document.getElementById('navHomeLink');
+    const gallery = document.getElementById('navGalleryLink');
+    if (home) home.classList.toggle('active', mode === 'home');
+    if (gallery) gallery.classList.toggle('active', mode === 'gallery');
 }
 
 function centerMapOnEntry(entry) {
@@ -1271,8 +1778,15 @@ function renderGalleryPane(feedContent, context) {
                             <img src="${photo.src}" alt="${escapeHtml(photo.name || 'Foto de galeria')}">
                             <div class="gallery-item-meta">
                                 <strong>${escapeHtml(photo.name || 'Foto')}</strong>
+                                ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
                                 <span>${escapeHtml(photo.addedAt || '')}</span>
                             </div>
+                            ${canUpload ? `
+                                <div class="gallery-item-controls">
+                                    <button type="button" class="gallery-edit-btn" data-edit-spot-photo="${photo.id}">Editar</button>
+                                    <button type="button" class="gallery-remove-btn" data-remove-spot-photo="${photo.id}">Eliminar</button>
+                                </div>
+                            ` : ''}
                         </article>
                     `).join('')
                     : `
@@ -1287,6 +1801,7 @@ function renderGalleryPane(feedContent, context) {
     `;
 
     bindGalleryPaneUi(context);
+    scheduleMasonryLayout(feedContent);
 }
 
 function bindGalleryPaneUi(context) {
@@ -1323,6 +1838,24 @@ function bindGalleryPaneUi(context) {
             setGalleryView(view);
         });
     });
+
+    document.querySelectorAll('[data-edit-spot-photo]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('editar fotos')) {
+                return;
+            }
+            editSpotGalleryPhoto(context, button.dataset.editSpotPhoto);
+        });
+    });
+
+    document.querySelectorAll('[data-remove-spot-photo]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('eliminar fotos')) {
+                return;
+            }
+            removeSpotGalleryPhoto(context, button.dataset.removeSpotPhoto);
+        });
+    });
 }
 
 function setGalleryView(view) {
@@ -1336,29 +1869,62 @@ function appendPhotosToGallery(context, files) {
         return;
     }
 
-    const existing = galleryPhotosBySpot.get(context.spotKey) || [];
-    const readers = files.map((file) => {
-        return new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onload = function(loadEvent) {
-                resolve({
-                    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                    src: String(loadEvent.target && loadEvent.target.result ? loadEvent.target.result : ''),
-                    name: file.name,
-                    addedAt: new Date().toLocaleDateString('es-CO', { year: 'numeric', month: 'short', day: 'numeric' })
-                });
-            };
-            reader.onerror = function() {
-                resolve(null);
-            };
-            reader.readAsDataURL(file);
-        });
+    const spotKey = String(context.spotKey || '');
+    void uploadGalleryFiles(files, { scope: 'spot', spotKey }).then((items) => {
+        if (!items.length) return;
+        const existing = galleryPhotosBySpot.get(spotKey) || [];
+        galleryPhotosBySpot.set(spotKey, [...items, ...existing]);
+        renderThreads();
     });
+}
 
-    Promise.all(readers).then((items) => {
-        const validItems = items.filter((item) => item && item.src);
-        if (!validItems.length) return;
-        galleryPhotosBySpot.set(context.spotKey, [...validItems, ...existing]);
+function editSpotGalleryPhoto(context, photoId) {
+    if (!context || !photoId) return;
+
+    const current = galleryPhotosBySpot.get(context.spotKey) || [];
+    const index = current.findIndex((photo) => String(photo.id) === String(photoId));
+    if (index < 0) return;
+
+    const edited = promptPhotoEdition(current[index]);
+    if (!edited) return;
+
+    const next = [...current];
+    next[index] = {
+        ...next[index],
+        ...edited
+    };
+    galleryPhotosBySpot.set(context.spotKey, next);
+    const updated = next[index];
+    if (isBackendReady() && updated.persisted) {
+        void supabase
+            .from(SUPABASE_TABLES.photos)
+            .update({
+                file_name: updated.name,
+                description: updated.description
+            })
+            .eq('id', updated.id)
+            .then(({ error }) => {
+                if (error) {
+                    logSupabaseError('No se pudo editar metadata de la foto', error);
+                }
+            });
+    }
+    renderThreads();
+}
+
+function removeSpotGalleryPhoto(context, photoId) {
+    if (!context || !photoId) return;
+
+    const current = galleryPhotosBySpot.get(context.spotKey) || [];
+    const target = current.find((photo) => String(photo.id) === String(photoId));
+    if (!confirmPhotoDeletion(target ? target.name : '')) {
+        return;
+    }
+
+    void deleteGalleryPhoto(target).then((deleted) => {
+        if (!deleted) return;
+        const next = current.filter((photo) => String(photo.id) !== String(photoId));
+        galleryPhotosBySpot.set(context.spotKey, next);
         renderThreads();
     });
 }
@@ -1952,3 +2518,4 @@ function focusThread(threadId) {
 }
 
 window.addEventListener('DOMContentLoaded', initMap);
+
