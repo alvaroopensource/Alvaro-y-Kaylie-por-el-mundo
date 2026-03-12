@@ -16,7 +16,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "firebase": "^12.10.0",
+    "@supabase/supabase-js": "^2.99.1",
     "leaflet": "^1.9.4"
   }
 }

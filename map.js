@@ -1,4 +1,4 @@
-import { db } from './firebase-config.js';
+import { supabase, isSupabaseEnabled } from './supabase-config.js';
 
 const BARRANQUILLA = {
     lat: 10.9878,
@@ -14,6 +14,15 @@ const CATEGORY_META = {
 };
 
 const threads = [];
+const SUPABASE_TABLES = {
+    spots: 'map_spots',
+    entries: 'map_entries'
+};
+const MANUAL_AUTH_USERS = {
+    Kaylie: 'kaylie123',
+    Alvaro: 'alvaro123'
+};
+const MANUAL_AUTH_STORAGE_KEY = 'map_manual_auth_user';
 
 let map;
 let markers = [];
@@ -23,21 +32,25 @@ let draftDragState = null;
 let isDraftPlacementMode = false;
 let pendingDraftLatLng = null;
 let draftSpotName = '';
-let nextCreatedSpotId = 1;
+let nextLocalSpotId = 1;
 const createdSpotMarkers = new Map();
 let pendingRenameSpotId = null;
 let pendingConfirmAction = null;
 let activeComposerContext = null;
 let activeGalleryContext = null;
+let activeReadEntryId = null;
+let currentManualUser = null;
 const entryDraftsBySpot = new Map();
 const galleryPhotosBySpot = new Map();
 const publishedEntries = [];
-let nextPublishedEntryId = 1;
+let nextLocalEntryId = 1;
 
-// Keep the Firestore instance reachable for the next persistence step.
-window.projectDb = db;
+// Keep the backend client reachable from devtools.
+window.projectDb = supabase;
 
 function initMap() {
+    currentManualUser = window.sessionStorage.getItem(MANUAL_AUTH_STORAGE_KEY);
+
     map = L.map('map', {
         center: [BARRANQUILLA.lat, BARRANQUILLA.lng],
         zoom: 13,
@@ -57,6 +70,136 @@ function initMap() {
     renderThreadDetail(activeThreadId);
     renderHomeEntriesFeed();
     bindStaticUi();
+    updateLoginButtonState();
+
+    void hydrateFromSupabase();
+}
+
+function isBackendReady() {
+    return Boolean(supabase && isSupabaseEnabled);
+}
+
+function isManualAuthenticated() {
+    return Boolean(currentManualUser && MANUAL_AUTH_USERS[currentManualUser]);
+}
+
+function ensureManualAuth(featureLabel) {
+    if (isManualAuthenticated()) {
+        return true;
+    }
+
+    const suffix = featureLabel ? ` para ${featureLabel}` : '';
+    window.alert(`Debes iniciar sesion${suffix}.`);
+    openAuthModal();
+    return false;
+}
+
+function nextLocalSpotKey() {
+    return `local-${nextLocalSpotId++}`;
+}
+
+function nextLocalEntryKey() {
+    return `local-entry-${nextLocalEntryId++}`;
+}
+
+function logSupabaseError(action, error) {
+    const message = error && error.message ? error.message : error;
+    console.error(`[Supabase] ${action}`, message);
+}
+
+function mapEntryRecordToViewModel(entryRecord, fallback = {}) {
+    const spotId = String(entryRecord.spot_id || fallback.spotKey || 'draft');
+    const linkedSpot = createdSpotMarkers.get(spotId);
+    const spotName = entryRecord.spot_name || fallback.spotName || (linkedSpot ? linkedSpot.name : 'Spot');
+    const content = entryRecord.content_html || fallback.content || '';
+    const excerpt = entryRecord.excerpt || fallback.excerpt || getPlainTextFromHtml(content).slice(0, 180);
+
+    return {
+        id: String(entryRecord.id || fallback.id || nextLocalEntryKey()),
+        spotKey: spotId,
+        spotName,
+        title: entryRecord.title || fallback.title || `Entrada en ${spotName}`,
+        excerpt,
+        content,
+        createdAt: entryRecord.created_at || fallback.createdAt || new Date().toISOString()
+    };
+}
+
+function addSpotMarkerFromRecord(spotRecord) {
+    const spotId = String(spotRecord.id || '');
+    if (!spotId || createdSpotMarkers.has(spotId)) {
+        return;
+    }
+
+    const lat = Number(spotRecord.lat);
+    const lng = Number(spotRecord.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return;
+    }
+
+    const spotName = String(spotRecord.name || 'Nuevo spot');
+    const marker = L.marker([lat, lng], {
+        icon: createSavedSpotIcon(spotName, spotId)
+    }).addTo(map);
+
+    createdSpotMarkers.set(spotId, {
+        marker,
+        name: spotName,
+        persisted: true
+    });
+    bindCreatedSpotActions(marker, spotId);
+}
+
+async function hydrateFromSupabase() {
+    if (!isBackendReady()) {
+        return;
+    }
+
+    const { data: spotRows, error: spotsError } = await supabase
+        .from(SUPABASE_TABLES.spots)
+        .select('id, name, lat, lng, created_at')
+        .order('created_at', { ascending: true });
+
+    if (spotsError) {
+        logSupabaseError('No se pudieron cargar los spots', spotsError);
+    } else {
+        (spotRows || []).forEach(addSpotMarkerFromRecord);
+    }
+
+    const { data: entryRows, error: entriesError } = await supabase
+        .from(SUPABASE_TABLES.entries)
+        .select('id, spot_id, spot_name, title, excerpt, content_html, created_at')
+        .order('created_at', { ascending: false });
+
+    if (entriesError) {
+        logSupabaseError('No se pudieron cargar las entradas', entriesError);
+        return;
+    }
+
+    publishedEntries.length = 0;
+    (entryRows || []).forEach((entryRecord) => {
+        publishedEntries.push(mapEntryRecordToViewModel(entryRecord));
+    });
+    renderHomeEntriesFeed();
+}
+
+function isPersistedSpot(spotId) {
+    const createdSpot = createdSpotMarkers.get(String(spotId));
+    return Boolean(createdSpot && createdSpot.persisted);
+}
+
+async function getCurrentUserId() {
+    if (!isBackendReady()) {
+        return null;
+    }
+
+    const { data, error } = await supabase.auth.getUser();
+    if (error) {
+        logSupabaseError('No se pudo consultar la sesion', error);
+        return null;
+    }
+
+    return data && data.user ? data.user.id : null;
 }
 
 function bindStaticUi() {
@@ -434,7 +577,7 @@ function closeSpotModal(options = {}) {
     pendingRenameSpotId = null;
 }
 
-function handleSpotModalSubmit(event) {
+async function handleSpotModalSubmit(event) {
     event.preventDefault();
 
     const input = document.getElementById('spotNameInput');
@@ -444,7 +587,7 @@ function handleSpotModalSubmit(event) {
     draftSpotName = value || 'Nuevo spot';
 
     if (pendingRenameSpotId) {
-        renameCreatedSpot(pendingRenameSpotId, draftSpotName);
+        await renameCreatedSpot(pendingRenameSpotId, draftSpotName);
         updateComposerLocation(pendingDraftLatLng, `Spot renombrado: ${draftSpotName}`);
         closeSpotModal({ preserveMarker: true });
         return;
@@ -454,23 +597,47 @@ function handleSpotModalSubmit(event) {
         placeDraftLocationMarker(pendingDraftLatLng);
     }
 
-    finalizeDraftSpot();
+    await finalizeDraftSpot();
     updateComposerLocation(pendingDraftLatLng, `Spot: ${draftSpotName}`);
     closeSpotModal({ preserveMarker: true });
 }
 
-function finalizeDraftSpot() {
+async function finalizeDraftSpot() {
     if (!draftLocationMarker) {
         return;
     }
 
-    const spotId = String(nextCreatedSpotId++);
     const spotName = draftSpotName || 'Nuevo spot';
+    const latlng = draftLocationMarker.getLatLng();
+    let spotId = nextLocalSpotKey();
+    let persisted = false;
+
+    if (isBackendReady()) {
+        const createdBy = await getCurrentUserId();
+        const { data, error } = await supabase
+            .from(SUPABASE_TABLES.spots)
+            .insert({
+                name: spotName,
+                lat: latlng.lat,
+                lng: latlng.lng,
+                created_by: createdBy
+            })
+            .select('id')
+            .single();
+
+        if (error) {
+            logSupabaseError('No se pudo guardar el spot', error);
+        } else {
+            spotId = String(data.id);
+            persisted = true;
+        }
+    }
 
     draftLocationMarker.setIcon(createSavedSpotIcon(spotName, spotId));
     createdSpotMarkers.set(spotId, {
         marker: draftLocationMarker,
-        name: spotName
+        name: spotName,
+        persisted
     });
 
     bindCreatedSpotActions(draftLocationMarker, spotId);
@@ -632,15 +799,14 @@ function handleCreatedSpotActionClick(event) {
         openConfirmModal(
             `Si eliminas "${name}", el spot desaparecera del mapa y las futuras entradas tendran que volver a ubicarse manualmente.`,
             function() {
-                map.removeLayer(marker);
-                createdSpotMarkers.delete(spotId);
+                void removeCreatedSpot(spotId);
                 closeAllSpotMenus();
             }
         );
     }
 }
 
-function renameCreatedSpot(spotId, nextName) {
+async function renameCreatedSpot(spotId, nextName) {
     const createdSpot = createdSpotMarkers.get(spotId);
     if (!createdSpot) {
         return;
@@ -649,6 +815,48 @@ function renameCreatedSpot(spotId, nextName) {
     createdSpot.name = nextName;
     createdSpot.marker.setIcon(createSavedSpotIcon(nextName, spotId));
     bindCreatedSpotActions(createdSpot.marker, spotId);
+
+    if (!createdSpot.persisted || !isBackendReady()) {
+        return;
+    }
+
+    const { error } = await supabase
+        .from(SUPABASE_TABLES.spots)
+        .update({ name: nextName })
+        .eq('id', spotId);
+
+    if (error) {
+        logSupabaseError('No se pudo renombrar el spot', error);
+    }
+}
+
+async function removeCreatedSpot(spotId) {
+    const createdSpot = createdSpotMarkers.get(spotId);
+    if (!createdSpot) {
+        return;
+    }
+
+    if (createdSpot.persisted && isBackendReady()) {
+        const { error } = await supabase
+            .from(SUPABASE_TABLES.spots)
+            .delete()
+            .eq('id', spotId);
+
+        if (error) {
+            logSupabaseError('No se pudo eliminar el spot', error);
+            return;
+        }
+    }
+
+    map.removeLayer(createdSpot.marker);
+    createdSpotMarkers.delete(spotId);
+
+    const nextEntries = publishedEntries.filter((entry) => String(entry.spotKey) !== String(spotId));
+    if (nextEntries.length !== publishedEntries.length) {
+        publishedEntries.length = 0;
+        publishedEntries.push(...nextEntries);
+        renderHomeEntriesFeed();
+    }
 }
 
 function handleSpotShellClick(event) {
@@ -705,13 +913,13 @@ function closeConfirmModal() {
 
 function openAuthModal() {
     const overlay = document.getElementById('authModalOverlay');
-    const emailInput = document.getElementById('authEmailInput');
+    const userInput = document.getElementById('authUserInput');
     if (!overlay) return;
 
     overlay.hidden = false;
     window.setTimeout(() => {
-        if (emailInput) {
-            emailInput.focus();
+        if (userInput) {
+            userInput.focus();
         }
     }, 0);
 }
@@ -737,9 +945,66 @@ function closeAuthModal() {
     }
 }
 
-function handleAuthModalSubmit(event) {
+async function handleAuthModalSubmit(event) {
     event.preventDefault();
+
+    const form = document.getElementById('authModalForm');
+    const userInput = document.getElementById('authUserInput');
+    const passwordInput = document.getElementById('authPasswordInput');
+    if (!form || !userInput || !passwordInput) {
+        closeAuthModal();
+        return;
+    }
+
+    const userName = userInput.value.trim();
+    const password = passwordInput.value;
+    const submitButton = form.querySelector('button[type="submit"]');
+    const defaultLabel = submitButton ? submitButton.textContent : 'Entrar';
+
+    if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.textContent = 'Validando...';
+    }
+
+    const expectedPassword = MANUAL_AUTH_USERS[userName];
+    const success = Boolean(expectedPassword) && password === expectedPassword;
+
+    if (!success) {
+        if (submitButton) {
+            submitButton.disabled = false;
+            submitButton.textContent = defaultLabel;
+        }
+        window.alert('Nombre o contraseña incorrectos.');
+        return;
+    }
+
+    currentManualUser = userName;
+    window.sessionStorage.setItem(MANUAL_AUTH_STORAGE_KEY, userName);
+    updateLoginButtonState();
+
+    if (submitButton) {
+        submitButton.disabled = false;
+        submitButton.textContent = defaultLabel;
+    }
+
     closeAuthModal();
+}
+
+function updateLoginButtonState() {
+    const loginLauncher = document.getElementById('loginLauncher');
+    if (!loginLauncher) return;
+
+    if (currentManualUser) {
+        loginLauncher.setAttribute('title', `Sesion iniciada: ${currentManualUser}`);
+        loginLauncher.setAttribute('aria-label', `Sesion iniciada: ${currentManualUser}`);
+        loginLauncher.classList.add('is-authenticated');
+    } else {
+        loginLauncher.setAttribute('title', 'Iniciar sesion');
+        loginLauncher.setAttribute('aria-label', 'Iniciar sesion');
+        loginLauncher.classList.remove('is-authenticated');
+    }
+
+    renderThreads();
 }
 
 function toggleAuthPasswordVisibility() {
@@ -786,6 +1051,7 @@ function renderThreads() {
     if (activeComposerContext) {
         document.body.classList.add('compose-mode');
         document.body.classList.remove('gallery-mode');
+        document.body.classList.remove('read-mode');
         renderEntryComposer(feedContent, activeComposerContext);
         return;
     }
@@ -793,12 +1059,22 @@ function renderThreads() {
     if (activeGalleryContext) {
         document.body.classList.remove('compose-mode');
         document.body.classList.add('gallery-mode');
+        document.body.classList.remove('read-mode');
         renderGalleryPane(feedContent, activeGalleryContext);
+        return;
+    }
+
+    if (activeReadEntryId) {
+        document.body.classList.remove('compose-mode');
+        document.body.classList.remove('gallery-mode');
+        document.body.classList.add('read-mode');
+        renderEntryReaderPane(feedContent, activeReadEntryId);
         return;
     }
 
     document.body.classList.remove('compose-mode');
     document.body.classList.remove('gallery-mode');
+    document.body.classList.remove('read-mode');
 
     if (feedCount) feedCount.textContent = `${threads.length} publicadas`;
     feedContent.innerHTML = threads
@@ -840,8 +1116,10 @@ function renderThreads() {
 function openEntryComposer(context) {
     activeComposerContext = context;
     activeGalleryContext = null;
+    activeReadEntryId = null;
     document.body.classList.add('compose-mode');
     document.body.classList.remove('gallery-mode');
+    document.body.classList.remove('read-mode');
     renderThreads();
 
     const feedContent = document.getElementById('feedContent');
@@ -866,8 +1144,10 @@ function openGalleryPane(context) {
         view: currentView
     };
     activeComposerContext = null;
+    activeReadEntryId = null;
     document.body.classList.remove('compose-mode');
     document.body.classList.add('gallery-mode');
+    document.body.classList.remove('read-mode');
     renderThreads();
 
     const feedContent = document.getElementById('feedContent');
@@ -882,8 +1162,86 @@ function closeGalleryPane() {
     renderThreads();
 }
 
+function openEntryReader(entryId) {
+    activeReadEntryId = String(entryId);
+    activeComposerContext = null;
+    activeGalleryContext = null;
+    document.body.classList.remove('compose-mode');
+    document.body.classList.remove('gallery-mode');
+    document.body.classList.add('read-mode');
+    renderThreads();
+
+    const entry = publishedEntries.find((item) => String(item.id) === activeReadEntryId);
+    if (entry) {
+        centerMapOnEntry(entry);
+    }
+
+    const feedContent = document.getElementById('feedContent');
+    if (feedContent) {
+        feedContent.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+}
+
+function closeEntryReader() {
+    activeReadEntryId = null;
+    document.body.classList.remove('read-mode');
+    renderThreads();
+}
+
+function centerMapOnEntry(entry) {
+    if (!map || !entry) return;
+
+    const spot = createdSpotMarkers.get(String(entry.spotKey));
+    if (spot && spot.marker) {
+        const latlng = spot.marker.getLatLng();
+        map.setView([latlng.lat, latlng.lng], 17, {
+            animate: true,
+            duration: 0.6
+        });
+        return;
+    }
+
+    if (entry.lat && entry.lng) {
+        map.setView([entry.lat, entry.lng], 17, {
+            animate: true,
+            duration: 0.6
+        });
+    }
+}
+
+function renderEntryReaderPane(feedContent, entryId) {
+    const entry = publishedEntries.find((item) => String(item.id) === String(entryId));
+    if (!entry) {
+        activeReadEntryId = null;
+        renderThreads();
+        return;
+    }
+
+    feedContent.innerHTML = `
+        <article class="entry-reader-panel" aria-label="Lectura de entrada">
+            <header class="entry-reader-head">
+                <div class="entry-reader-meta">
+                    <span>${escapeHtml(entry.spotName)}</span>
+                    <span>${formatEntryDate(entry.createdAt)}</span>
+                </div>
+                <button class="ghost-btn" type="button" id="closeEntryReaderBtn">Volver</button>
+            </header>
+            <h2>${escapeHtml(entry.title)}</h2>
+            <section class="entry-reader-body">
+                ${entry.content}
+            </section>
+        </article>
+    `;
+
+    const closeBtn = document.getElementById('closeEntryReaderBtn');
+    if (closeBtn) {
+        closeBtn.addEventListener('click', closeEntryReader);
+    }
+}
+
 function renderGalleryPane(feedContent, context) {
     const photos = galleryPhotosBySpot.get(context.spotKey) || [];
+    const canUpload = isManualAuthenticated();
 
     feedContent.innerHTML = `
         <section class="gallery-panel" aria-label="Galeria del spot">
@@ -895,7 +1253,7 @@ function renderGalleryPane(feedContent, context) {
                 </div>
                 <div class="gallery-head-actions">
                     <button class="ghost-btn" type="button" id="closeGalleryBtn">Volver al feed</button>
-                    <button class="primary-btn" type="button" id="addGalleryPhotoBtn">Agregar fotos</button>
+                    <button class="primary-btn" type="button" id="addGalleryPhotoBtn" ${canUpload ? '' : 'disabled'} title="${canUpload ? 'Agregar fotos' : 'Inicia sesion para agregar fotos'}">Agregar fotos</button>
                     <input id="galleryPhotoInput" type="file" accept="image/*" multiple hidden>
                 </div>
             </header>
@@ -942,6 +1300,9 @@ function bindGalleryPaneUi(context) {
 
     if (addBtn && input) {
         addBtn.addEventListener('click', function() {
+            if (!ensureManualAuth('agregar fotos')) {
+                return;
+            }
             input.click();
         });
     }
@@ -971,6 +1332,10 @@ function setGalleryView(view) {
 }
 
 function appendPhotosToGallery(context, files) {
+    if (!ensureManualAuth('agregar fotos')) {
+        return;
+    }
+
     const existing = galleryPhotosBySpot.get(context.spotKey) || [];
     const readers = files.map((file) => {
         return new Promise((resolve) => {
@@ -1003,6 +1368,7 @@ function renderEntryComposer(feedContent, context) {
         title: '',
         content: ''
     };
+    const canPublish = isManualAuthenticated();
 
     feedContent.innerHTML = `
         <section class="entry-editor-panel" aria-label="Editor de nueva entrada">
@@ -1013,7 +1379,7 @@ function renderEntryComposer(feedContent, context) {
                 <div class="entry-editor-actions">
                     <button class="ghost-btn" type="button" id="closeComposerBtn">Descartar entrada</button>
                     <button class="ghost-btn" type="button" id="saveDraftBtn">Guardar borrador</button>
-                    <button class="primary-btn" type="button" id="publishEntryBtn">Publicar</button>
+                    <button class="primary-btn" type="button" id="publishEntryBtn" ${canPublish ? '' : 'disabled'} title="${canPublish ? 'Publicar' : 'Inicia sesion para publicar'}">Publicar</button>
                 </div>
             </header>
 
@@ -1110,15 +1476,17 @@ function bindEntryComposerUi(context) {
     }
 
     if (publishBtn) {
-        publishBtn.addEventListener('click', function() {
-            const published = publishEntry(context, titleInput, editor);
+        publishBtn.addEventListener('click', async function() {
+            if (!ensureManualAuth('publicar entradas')) {
+                return;
+            }
+            publishBtn.disabled = true;
+            const published = await publishEntry(context, titleInput, editor);
+            publishBtn.disabled = false;
             if (!published) {
                 return;
             }
-            publishBtn.textContent = 'Publicado';
-            window.setTimeout(() => {
-                publishBtn.textContent = 'Publicar';
-            }, 1200);
+            closeEntryComposer();
         });
     }
 
@@ -1244,7 +1612,11 @@ function saveEntryDraft(context, titleInput, editor) {
     });
 }
 
-function publishEntry(context, titleInput, editor) {
+async function publishEntry(context, titleInput, editor) {
+    if (!ensureManualAuth('publicar entradas')) {
+        return false;
+    }
+
     if (!context || !titleInput || !editor) return false;
 
     const title = titleInput.value.trim() || `Entrada en ${context.spotName}`;
@@ -1256,16 +1628,40 @@ function publishEntry(context, titleInput, editor) {
         return false;
     }
 
-    const createdAt = new Date();
-    publishedEntries.unshift({
-        id: nextPublishedEntryId++,
+    const fallbackEntry = {
+        id: nextLocalEntryKey(),
         spotKey: context.spotKey,
         spotName: context.spotName,
         title,
         excerpt,
         content: html,
-        createdAt
-    });
+        createdAt: new Date()
+    };
+    let entryForFeed = fallbackEntry;
+
+    if (isBackendReady() && isPersistedSpot(context.spotKey)) {
+        const createdBy = await getCurrentUserId();
+        const { data, error } = await supabase
+            .from(SUPABASE_TABLES.entries)
+            .insert({
+                spot_id: context.spotKey,
+                spot_name: context.spotName,
+                title,
+                excerpt,
+                content_html: html,
+                created_by: createdBy
+            })
+            .select('id, spot_id, spot_name, title, excerpt, content_html, created_at')
+            .single();
+
+        if (error) {
+            logSupabaseError('No se pudo publicar la entrada', error);
+        } else {
+            entryForFeed = mapEntryRecordToViewModel(data, fallbackEntry);
+        }
+    }
+
+    publishedEntries.unshift(entryForFeed);
 
     saveEntryDraft(context, titleInput, editor);
     renderHomeEntriesFeed();
@@ -1303,6 +1699,14 @@ function renderHomeEntriesFeed() {
             </article>
         `)
         .join('');
+
+    Array.from(container.querySelectorAll('.home-entry-card')).forEach((card) => {
+        card.addEventListener('click', function() {
+            const entryId = card.dataset.publishedEntryId;
+            if (!entryId) return;
+            openEntryReader(entryId);
+        });
+    });
 }
 
 function getPlainTextFromHtml(html) {

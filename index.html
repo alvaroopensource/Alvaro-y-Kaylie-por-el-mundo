@@ -99,7 +99,6 @@
 
                 <section class="home-entries-section" aria-label="Entradas recientes">
                     <div class="home-entries-head">
-                        <h3>Entradas recientes</h3>
                         <span id="homeEntriesCount">0 publicadas</span>
                     </div>
                     <div class="home-entries-feed" id="homeEntriesFeed"></div>
@@ -121,8 +120,12 @@
             <p class="spot-modal-kicker">Acceso</p>
             <h2 id="authModalTitle">Inicia sesión</h2>
             <form class="auth-modal-form" id="authModalForm">
-                <label class="spot-modal-label" for="authEmailInput">Correo</label>
-                <input class="spot-modal-input" id="authEmailInput" name="email" type="email" autocomplete="email" required>
+                <label class="spot-modal-label" for="authUserInput">Nombre</label>
+                <select class="spot-modal-input" id="authUserInput" name="user_name" required>
+                    <option value="" selected disabled>¿Quien eres?</option>
+                    <option value="Kaylie">Kaylie</option>
+                    <option value="Alvaro">Alvaro</option>
+                </select>
                 <label class="spot-modal-label" for="authPasswordInput">Contraseña</label>
                 <div class="auth-password-field">
                     <input class="spot-modal-input auth-password-input" id="authPasswordInput" name="password" type="password" autocomplete="current-password" required>
