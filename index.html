@@ -119,12 +119,12 @@
         <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
             <p class="spot-modal-kicker">Acceso</p>
             <h2 id="authModalTitle">Inicia sesión</h2>
-            <form class="auth-modal-form" id="authModalForm">
-                <label class="spot-modal-label" for="authUserInput">Nombre</label>
+            <form class="auth-modal-form" id="authModalForm" autocomplete="off">
+                <label class="spot-modal-label" for="authUserInput">¿Quién eres?</label>
                 <select class="spot-modal-input" id="authUserInput" name="user_name" required>
-                    <option value="" selected disabled>¿Quien eres?</option>
-                    <option value="Kaylie">Kaylie</option>
+                    <option value="" selected hidden></option>
                     <option value="Alvaro">Alvaro</option>
+                    <option value="Kaylie">Kaylie</option>
                 </select>
                 <label class="spot-modal-label" for="authPasswordInput">Contraseña</label>
                 <div class="auth-password-field">
@@ -143,3 +143,5 @@
     <script type="module" src="map.js"></script>
 </body>
 </html>
+
+

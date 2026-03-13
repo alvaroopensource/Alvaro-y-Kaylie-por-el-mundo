@@ -22,11 +22,19 @@ const SUPABASE_TABLES = {
 const SUPABASE_STORAGE = {
     galleryBucket: 'map-gallery'
 };
-const MANUAL_AUTH_USERS = {
-    Kaylie: 'kaylie123',
-    Alvaro: 'alvaro123'
+const AUTH_USER_EMAILS = {
+    Alvaro: 'alvaro@mi-mapa.com',
+    Kaylie: 'kaylie@mi-mapa.com'
 };
-const MANUAL_AUTH_STORAGE_KEY = 'map_manual_auth_user';
+const AUTHOR_NAME_STORAGE_KEY = 'map-author-name-by-id';
+const SPOT_MARKER_SCALE_CONFIG = {
+    minZoom: 10,
+    maxZoom: 18,
+    minScale: 0.42,
+    maxScale: 1.2,
+    hideBelowZoom: 12,
+    growthExponent: 1.65
+};
 
 let map;
 let markers = [];
@@ -44,20 +52,21 @@ let activeComposerContext = null;
 let activeGalleryContext = null;
 let activeReadEntryId = null;
 let activeGlobalGalleryMode = false;
+let activeEntriesSpotFilter = null;
 let currentManualUser = null;
+let currentSessionUserId = null;
 let masonryResizeTimer = null;
 const entryDraftsBySpot = new Map();
 const galleryPhotosBySpot = new Map();
 const globalGalleryPhotos = [];
 const publishedEntries = [];
+const knownAuthorNamesById = loadKnownAuthorNamesById();
 let nextLocalEntryId = 1;
 
 // Keep the backend client reachable from devtools.
 window.projectDb = supabase;
 
 function initMap() {
-    currentManualUser = window.sessionStorage.getItem(MANUAL_AUTH_STORAGE_KEY);
-
     map = L.map('map', {
         center: [BARRANQUILLA.lat, BARRANQUILLA.lng],
         zoom: 13,
@@ -70,6 +79,7 @@ function initMap() {
         maxZoom: 19,
         className: 'forum-tiles'
     }).addTo(map);
+    bindSpotMarkerZoomScaling();
 
     renderCategories();
     renderThreads();
@@ -79,7 +89,43 @@ function initMap() {
     bindStaticUi();
     updateLoginButtonState();
 
+    void hydrateAuthState();
     void hydrateFromSupabase();
+}
+
+function clampNumber(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function computeSpotMarkerScale(zoomLevel) {
+    const { minZoom, maxZoom, minScale, maxScale, growthExponent } = SPOT_MARKER_SCALE_CONFIG;
+    const ratio = clampNumber((zoomLevel - minZoom) / (maxZoom - minZoom), 0, 1);
+    const easedRatio = Math.pow(ratio, growthExponent);
+    return minScale + ((maxScale - minScale) * easedRatio);
+}
+
+function updateSpotMarkerScale(zoomLevel) {
+    if (!map) return;
+    const targetZoom = Number.isFinite(zoomLevel) ? zoomLevel : map.getZoom();
+    const nextScale = computeSpotMarkerScale(targetZoom).toFixed(3);
+    const container = map.getContainer();
+    const shouldHideSpots = targetZoom < SPOT_MARKER_SCALE_CONFIG.hideBelowZoom;
+
+    container.style.setProperty('--spot-marker-scale', nextScale);
+    container.classList.toggle('spots-hidden-by-zoom', shouldHideSpots);
+}
+
+function bindSpotMarkerZoomScaling() {
+    if (!map) return;
+
+    updateSpotMarkerScale(map.getZoom());
+    map.on('zoom', function() {
+        updateSpotMarkerScale(map.getZoom());
+    });
+    map.on('zoomanim', function(event) {
+        if (!event || typeof event.zoom !== 'number') return;
+        updateSpotMarkerScale(event.zoom);
+    });
 }
 
 function isBackendReady() {
@@ -87,7 +133,123 @@ function isBackendReady() {
 }
 
 function isManualAuthenticated() {
-    return Boolean(currentManualUser && MANUAL_AUTH_USERS[currentManualUser]);
+    return Boolean(currentManualUser);
+}
+
+function getAuthEmailForUser(userName) {
+    if (!userName) return '';
+    return AUTH_USER_EMAILS[userName] || '';
+}
+
+function getUserNameFromEmail(emailValue) {
+    const normalized = String(emailValue || '').trim().toLowerCase();
+    if (!normalized) return '';
+
+    return Object.keys(AUTH_USER_EMAILS).find((key) => {
+        return String(AUTH_USER_EMAILS[key] || '').trim().toLowerCase() === normalized;
+    }) || '';
+}
+
+function normalizeManualUserName(userName) {
+    const normalized = String(userName || '').trim().toLowerCase();
+    if (normalized === 'alvaro') return 'Alvaro';
+    if (normalized === 'kaylie') return 'Kaylie';
+    return '';
+}
+
+function loadKnownAuthorNamesById() {
+    if (typeof window === 'undefined' || !window.localStorage) {
+        return new Map();
+    }
+
+    try {
+        const raw = window.localStorage.getItem(AUTHOR_NAME_STORAGE_KEY);
+        if (!raw) return new Map();
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return new Map();
+
+        const map = new Map();
+        Object.entries(parsed).forEach(([userId, userName]) => {
+            const canonical = normalizeManualUserName(userName);
+            if (canonical && userId) {
+                map.set(String(userId), canonical);
+            }
+        });
+        return map;
+    } catch (_error) {
+        return new Map();
+    }
+}
+
+function persistKnownAuthorNamesById() {
+    if (typeof window === 'undefined' || !window.localStorage) {
+        return;
+    }
+
+    const serializable = {};
+    knownAuthorNamesById.forEach((userName, userId) => {
+        serializable[String(userId)] = userName;
+    });
+    window.localStorage.setItem(AUTHOR_NAME_STORAGE_KEY, JSON.stringify(serializable));
+}
+
+function rememberAuthorName(userId, userName) {
+    const canonical = normalizeManualUserName(userName);
+    if (!userId || !canonical) {
+        return;
+    }
+
+    knownAuthorNamesById.set(String(userId), canonical);
+    persistKnownAuthorNamesById();
+}
+
+function resolveEntryAuthorName(createdBy, fallbackName) {
+    const fallbackCanonical = normalizeManualUserName(fallbackName);
+    if (fallbackCanonical) {
+        return fallbackCanonical;
+    }
+
+    const raw = String(createdBy || '').trim();
+    if (!raw) {
+        return 'Anonimo';
+    }
+
+    const directCanonical = normalizeManualUserName(raw);
+    if (directCanonical) {
+        return directCanonical;
+    }
+
+    const fromEmail = getUserNameFromEmail(raw);
+    if (fromEmail) {
+        const emailCanonical = normalizeManualUserName(fromEmail);
+        return emailCanonical || fromEmail;
+    }
+
+    const cachedName = knownAuthorNamesById.get(raw);
+    if (cachedName) {
+        return cachedName;
+    }
+
+    if (currentSessionUserId && currentManualUser && raw === currentSessionUserId) {
+        const currentCanonical = normalizeManualUserName(currentManualUser);
+        if (currentCanonical) {
+            rememberAuthorName(raw, currentCanonical);
+            return currentCanonical;
+        }
+    }
+
+    const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw);
+    return looksLikeUuid ? 'Autor' : raw;
+}
+
+function refreshPublishedEntriesAuthorNames() {
+    publishedEntries.forEach((entry) => {
+        entry.createdBy = resolveEntryAuthorName(entry.createdById, entry.createdBy);
+    });
+    renderHomeEntriesFeed();
+    if (activeReadEntryId) {
+        renderThreads();
+    }
 }
 
 function ensureManualAuth(featureLabel) {
@@ -99,6 +261,43 @@ function ensureManualAuth(featureLabel) {
     window.alert(`Debes iniciar sesion${suffix}.`);
     openAuthModal();
     return false;
+}
+
+async function hydrateAuthState() {
+    if (!isBackendReady()) {
+        currentManualUser = null;
+        updateLoginButtonState();
+        return;
+    }
+
+    const { data, error } = await supabase.auth.getSession();
+    if (error) {
+        logSupabaseError('No se pudo leer la sesion inicial', error);
+    }
+
+    const user = data && data.session ? data.session.user : null;
+    const userEmail = user ? (user.email || '') : '';
+    const userName = getUserNameFromEmail(userEmail);
+    currentSessionUserId = user ? user.id : null;
+    currentManualUser = userName || (user ? (user.email || user.id) : null);
+    if (currentSessionUserId && currentManualUser) {
+        rememberAuthorName(currentSessionUserId, currentManualUser);
+    }
+    refreshPublishedEntriesAuthorNames();
+    updateLoginButtonState();
+
+    supabase.auth.onAuthStateChange((_event, session) => {
+        const nextUser = session && session.user ? session.user : null;
+        const nextUserEmail = nextUser ? (nextUser.email || '') : '';
+        const nextUserName = getUserNameFromEmail(nextUserEmail);
+        currentSessionUserId = nextUser ? nextUser.id : null;
+        currentManualUser = nextUserName || (nextUser ? (nextUser.email || nextUser.id) : null);
+        if (currentSessionUserId && currentManualUser) {
+            rememberAuthorName(currentSessionUserId, currentManualUser);
+        }
+        refreshPublishedEntriesAuthorNames();
+        updateLoginButtonState();
+    });
 }
 
 function nextLocalSpotKey() {
@@ -126,6 +325,8 @@ function mapEntryRecordToViewModel(entryRecord, fallback = {}) {
         spotKey: spotId,
         spotName,
         title: entryRecord.title || fallback.title || `Entrada en ${spotName}`,
+        createdById: entryRecord.created_by || fallback.createdById || null,
+        createdBy: resolveEntryAuthorName(entryRecord.created_by, fallback.createdBy),
         excerpt,
         content,
         createdAt: entryRecord.created_at || fallback.createdAt || new Date().toISOString()
@@ -343,7 +544,7 @@ async function hydrateFromSupabase() {
 
     const { data: entryRows, error: entriesError } = await supabase
         .from(SUPABASE_TABLES.entries)
-        .select('id, spot_id, spot_name, title, excerpt, content_html, created_at')
+        .select('id, spot_id, spot_name, title, excerpt, content_html, created_at, created_by')
         .order('created_at', { ascending: false });
 
     if (entriesError) {
@@ -402,13 +603,21 @@ async function getCurrentUserId() {
         return null;
     }
 
-    const { data, error } = await supabase.auth.getUser();
+    const { data, error } = await supabase.auth.getSession();
     if (error) {
-        logSupabaseError('No se pudo consultar la sesion', error);
+        const message = String(error && error.message ? error.message : '');
+        if (!message.toLowerCase().includes('session missing')) {
+            logSupabaseError('No se pudo consultar la sesion', error);
+        }
         return null;
     }
 
-    return data && data.user ? data.user.id : null;
+    const user = data && data.session && data.session.user ? data.session.user : null;
+    currentSessionUserId = user ? user.id : null;
+    if (currentSessionUserId && currentManualUser) {
+        rememberAuthorName(currentSessionUserId, currentManualUser);
+    }
+    return currentSessionUserId;
 }
 
 function bindStaticUi() {
@@ -446,12 +655,31 @@ function bindStaticUi() {
 
     if (launcher) {
         launcher.addEventListener('click', function() {
+            if (!ensureManualAuth('crear spots')) {
+                return;
+            }
             setDraftPlacementMode(!isDraftPlacementMode);
         });
     }
 
     if (loginLauncher) {
-        loginLauncher.addEventListener('click', openAuthModal);
+        loginLauncher.addEventListener('click', function() {
+            if (!isManualAuthenticated()) {
+                openAuthModal();
+                return;
+            }
+
+            const shouldLogout = window.confirm('Ya hay una sesion activa. Quieres cerrar sesion?');
+            if (!shouldLogout) {
+                return;
+            }
+
+            if (isBackendReady()) {
+                void supabase.auth.signOut();
+            }
+            currentManualUser = null;
+            updateLoginButtonState();
+        });
     }
 
     if (spotModalForm) {
@@ -817,6 +1045,7 @@ async function handleSpotModalSubmit(event) {
 
     const input = document.getElementById('spotNameInput');
     if (!input || !pendingDraftLatLng) return;
+    if (!ensureManualAuth('crear spots')) return;
 
     const value = input.value.trim();
     draftSpotName = value || 'Nuevo spot';
@@ -832,23 +1061,31 @@ async function handleSpotModalSubmit(event) {
         placeDraftLocationMarker(pendingDraftLatLng);
     }
 
-    await finalizeDraftSpot();
+    const saved = await finalizeDraftSpot();
+    if (!saved) {
+        return;
+    }
     updateComposerLocation(pendingDraftLatLng, `Spot: ${draftSpotName}`);
     closeSpotModal({ preserveMarker: true });
 }
 
 async function finalizeDraftSpot() {
     if (!draftLocationMarker) {
-        return;
+        return false;
     }
 
     const spotName = draftSpotName || 'Nuevo spot';
     const latlng = draftLocationMarker.getLatLng();
-    let spotId = nextLocalSpotKey();
+    let spotId = '';
     let persisted = false;
 
     if (isBackendReady()) {
         const createdBy = await getCurrentUserId();
+        if (!createdBy) {
+            window.alert('Para crear spots necesitas iniciar sesion con una cuenta autenticada en Supabase.');
+            openAuthModal();
+            return false;
+        }
         const { data, error } = await supabase
             .from(SUPABASE_TABLES.spots)
             .insert({
@@ -862,10 +1099,15 @@ async function finalizeDraftSpot() {
 
         if (error) {
             logSupabaseError('No se pudo guardar el spot', error);
+            window.alert('No se pudo guardar el spot. Verifica tu sesion y permisos.');
+            return false;
         } else {
             spotId = String(data.id);
             persisted = true;
         }
+    } else {
+        window.alert('La configuracion de Supabase no esta lista. No se pueden crear spots.');
+        return false;
     }
 
     draftLocationMarker.setIcon(createSavedSpotIcon(spotName, spotId));
@@ -878,6 +1120,7 @@ async function finalizeDraftSpot() {
     bindCreatedSpotActions(draftLocationMarker, spotId);
     draftLocationMarker = null;
     draftSpotName = '';
+    return true;
 }
 
 function bindDraftLocationMarkerActions() {
@@ -917,6 +1160,7 @@ function handleDraftLocationActionClick(event) {
     }
 
     if (action === 'entries') {
+        focusEntriesBySpot('draft', draftSpotName || 'Nuevo spot');
         updateComposerLocation(latlng, `Entradas en ${draftSpotName || 'Nuevo spot'}`);
         closeAllSpotMenus();
         return;
@@ -1004,6 +1248,7 @@ function handleCreatedSpotActionClick(event) {
     }
 
     if (action === 'entries') {
+        focusEntriesBySpot(spotId, name);
         updateComposerLocation(latlng, `Entradas en ${name}`);
         closeAllSpotMenus();
         return;
@@ -1154,6 +1399,7 @@ function openAuthModal() {
     overlay.hidden = false;
     window.setTimeout(() => {
         if (userInput) {
+            userInput.value = '';
             userInput.focus();
         }
     }, 0);
@@ -1162,6 +1408,7 @@ function openAuthModal() {
 function closeAuthModal() {
     const overlay = document.getElementById('authModalOverlay');
     const form = document.getElementById('authModalForm');
+    const userInput = document.getElementById('authUserInput');
     const passwordInput = document.getElementById('authPasswordInput');
     const toggleButton = document.getElementById('toggleAuthPassword');
     if (overlay) {
@@ -1169,6 +1416,9 @@ function closeAuthModal() {
     }
     if (form) {
         form.reset();
+    }
+    if (userInput) {
+        userInput.value = '';
     }
     if (passwordInput) {
         passwordInput.type = 'password';
@@ -1191,7 +1441,28 @@ async function handleAuthModalSubmit(event) {
         return;
     }
 
-    const userName = userInput.value.trim();
+    if (!isBackendReady()) {
+        window.alert('Configura Supabase para iniciar sesion.');
+        return;
+    }
+
+    const selectedUserName = userInput.value.trim();
+    if (!selectedUserName) {
+        window.alert('Selecciona un usuario para iniciar sesion.');
+        return;
+    }
+
+    const email = getAuthEmailForUser(selectedUserName);
+    if (!email) {
+        window.alert('No existe un correo configurado para este usuario. Revisa AUTH_USER_EMAILS en map.js.');
+        return;
+    }
+
+    if (email.toLowerCase().endsWith('@tu-dominio.com')) {
+        window.alert('Debes actualizar AUTH_USER_EMAILS en map.js con los correos reales de Supabase Auth.');
+        return;
+    }
+
     const password = passwordInput.value;
     const submitButton = form.querySelector('button[type="submit"]');
     const defaultLabel = submitButton ? submitButton.textContent : 'Entrar';
@@ -1201,27 +1472,28 @@ async function handleAuthModalSubmit(event) {
         submitButton.textContent = 'Validando...';
     }
 
-    const expectedPassword = MANUAL_AUTH_USERS[userName];
-    const success = Boolean(expectedPassword) && password === expectedPassword;
-
-    if (!success) {
-        if (submitButton) {
-            submitButton.disabled = false;
-            submitButton.textContent = defaultLabel;
-        }
-        window.alert('Nombre o contraseña incorrectos.');
-        return;
-    }
-
-    currentManualUser = userName;
-    window.sessionStorage.setItem(MANUAL_AUTH_STORAGE_KEY, userName);
-    updateLoginButtonState();
+    const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password
+    });
 
     if (submitButton) {
         submitButton.disabled = false;
         submitButton.textContent = defaultLabel;
     }
 
+    if (error || !data || !data.user) {
+        window.alert(`No se pudo iniciar sesion: ${error ? error.message : 'credenciales invalidas'}`);
+        return;
+    }
+
+    const resolvedUserName = getUserNameFromEmail(data.user.email || email);
+    currentSessionUserId = data.user.id || null;
+    currentManualUser = resolvedUserName || selectedUserName || data.user.email || data.user.id;
+    if (currentSessionUserId && currentManualUser) {
+        rememberAuthorName(currentSessionUserId, currentManualUser);
+    }
+    updateLoginButtonState();
     closeAuthModal();
 }
 
@@ -1461,6 +1733,74 @@ function closeEntryReader() {
     renderThreads();
 }
 
+function isPersistedEntry(entry) {
+    if (!entry || !entry.id) return false;
+    return !String(entry.id).startsWith('local-entry-');
+}
+
+function confirmEntryDeletion(entryTitle) {
+    const safeTitle = entryTitle ? `"${entryTitle}"` : 'esta entrada';
+    window.alert(`Vas a eliminar ${safeTitle}.`);
+    return window.confirm(`Seguro que deseas eliminar ${safeTitle}? Esta accion no se puede deshacer.`);
+}
+
+async function editPublishedEntry(entryId) {
+    if (!ensureManualAuth('editar entradas')) {
+        return;
+    }
+
+    const entry = publishedEntries.find((item) => String(item.id) === String(entryId));
+    if (!entry) {
+        return;
+    }
+
+    openEntryComposer({
+        mode: 'edit',
+        entryId: String(entry.id),
+        spotKey: String(entry.spotKey || 'draft'),
+        spotName: entry.spotName || 'Spot'
+    });
+}
+
+async function removePublishedEntry(entryId) {
+    if (!ensureManualAuth('eliminar entradas')) {
+        return;
+    }
+
+    const index = publishedEntries.findIndex((item) => String(item.id) === String(entryId));
+    if (index < 0) {
+        return;
+    }
+
+    const target = publishedEntries[index];
+    if (!confirmEntryDeletion(target.title)) {
+        return;
+    }
+
+    if (isBackendReady() && isPersistedEntry(target)) {
+        const { error } = await supabase
+            .from(SUPABASE_TABLES.entries)
+            .delete()
+            .eq('id', target.id);
+
+        if (error) {
+            logSupabaseError('No se pudo eliminar la entrada', error);
+            window.alert('No se pudo eliminar la entrada en Supabase.');
+            return;
+        }
+    }
+
+    publishedEntries.splice(index, 1);
+    renderHomeEntriesFeed();
+
+    if (activeReadEntryId && String(activeReadEntryId) === String(entryId)) {
+        closeEntryReader();
+        return;
+    }
+
+    renderThreads();
+}
+
 function openGlobalGalleryPane() {
     activeGlobalGalleryMode = true;
     activeComposerContext = null;
@@ -1695,6 +2035,33 @@ function setNavMode(mode) {
     if (gallery) gallery.classList.toggle('active', mode === 'gallery');
 }
 
+function focusEntriesBySpot(spotKey, spotName) {
+    activeEntriesSpotFilter = {
+        spotKey: String(spotKey || ''),
+        spotName: String(spotName || 'Spot')
+    };
+
+    activeComposerContext = null;
+    activeGalleryContext = null;
+    activeReadEntryId = null;
+    activeGlobalGalleryMode = false;
+
+    setNavMode('home');
+    renderThreads();
+    renderHomeEntriesFeed();
+
+    const section = document.querySelector('.home-entries-section');
+    if (section) {
+        section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+}
+
+function clearEntriesFilter() {
+    if (!activeEntriesSpotFilter) return;
+    activeEntriesSpotFilter = null;
+    renderHomeEntriesFeed();
+}
+
 function centerMapOnEntry(entry) {
     if (!map || !entry) return;
 
@@ -1723,6 +2090,7 @@ function renderEntryReaderPane(feedContent, entryId) {
         renderThreads();
         return;
     }
+    const canManageEntry = isManualAuthenticated();
 
     feedContent.innerHTML = `
         <article class="entry-reader-panel" aria-label="Lectura de entrada">
@@ -1731,8 +2099,15 @@ function renderEntryReaderPane(feedContent, entryId) {
                     <span>${escapeHtml(entry.spotName)}</span>
                     <span>${formatEntryDate(entry.createdAt)}</span>
                 </div>
-                <button class="ghost-btn" type="button" id="closeEntryReaderBtn">Volver</button>
+                <div class="entry-reader-actions">
+                    ${canManageEntry ? `
+                        <button class="ghost-btn" type="button" id="editEntryBtn">Editar</button>
+                        <button class="ghost-btn entry-danger-btn" type="button" id="deleteEntryBtn">Eliminar</button>
+                    ` : ''}
+                    <button class="ghost-btn" type="button" id="closeEntryReaderBtn">Volver</button>
+                </div>
             </header>
+            <p class="entry-author">Por ${escapeHtml(entry.createdBy || 'Anonimo')}</p>
             <h2>${escapeHtml(entry.title)}</h2>
             <section class="entry-reader-body">
                 ${entry.content}
@@ -1741,8 +2116,20 @@ function renderEntryReaderPane(feedContent, entryId) {
     `;
 
     const closeBtn = document.getElementById('closeEntryReaderBtn');
+    const editBtn = document.getElementById('editEntryBtn');
+    const deleteBtn = document.getElementById('deleteEntryBtn');
     if (closeBtn) {
         closeBtn.addEventListener('click', closeEntryReader);
+    }
+    if (editBtn) {
+        editBtn.addEventListener('click', function() {
+            void editPublishedEntry(entry.id);
+        });
+    }
+    if (deleteBtn) {
+        deleteBtn.addEventListener('click', function() {
+            void removePublishedEntry(entry.id);
+        });
     }
 }
 
@@ -1929,23 +2316,63 @@ function removeSpotGalleryPhoto(context, photoId) {
     });
 }
 
-function renderEntryComposer(feedContent, context) {
-    const draft = entryDraftsBySpot.get(context.spotKey) || {
+function getEntryDraftKey(context) {
+    if (context && context.mode === 'edit' && context.entryId) {
+        return `entry:${String(context.entryId)}`;
+    }
+    return `spot:${String(context && context.spotKey ? context.spotKey : 'draft')}`;
+}
+
+function getInitialEntryDraft(context) {
+    const draftKey = getEntryDraftKey(context);
+    const savedDraft = entryDraftsBySpot.get(draftKey);
+    if (savedDraft) {
+        return savedDraft;
+    }
+
+    const legacyDraftKey = context && context.spotKey ? String(context.spotKey) : '';
+    const legacyDraft = legacyDraftKey ? entryDraftsBySpot.get(legacyDraftKey) : null;
+    if (legacyDraft) {
+        return legacyDraft;
+    }
+
+    if (context && context.mode === 'edit' && context.entryId) {
+        const existingEntry = publishedEntries.find((item) => String(item.id) === String(context.entryId));
+        if (existingEntry) {
+            return {
+                title: existingEntry.title || '',
+                content: existingEntry.content || ''
+            };
+        }
+    }
+
+    return {
         title: '',
         content: ''
     };
+}
+
+function renderEntryComposer(feedContent, context) {
+    const isEditingEntry = Boolean(context && context.mode === 'edit' && context.entryId);
+    const draft = getInitialEntryDraft(context);
     const canPublish = isManualAuthenticated();
+    const closeLabel = isEditingEntry ? 'Cancelar edicion' : 'Descartar entrada';
+    const publishLabel = isEditingEntry ? 'Guardar cambios' : 'Publicar';
+    const publishTitle = canPublish
+        ? publishLabel
+        : `Inicia sesion para ${isEditingEntry ? 'editar' : 'publicar'}`;
+    const panelAria = isEditingEntry ? 'Editor de entrada' : 'Editor de nueva entrada';
 
     feedContent.innerHTML = `
-        <section class="entry-editor-panel" aria-label="Editor de nueva entrada">
+        <section class="entry-editor-panel" aria-label="${panelAria}">
             <header class="entry-editor-head">
                 <div>
                     <h3>${context.spotName}</h3>
                 </div>
                 <div class="entry-editor-actions">
-                    <button class="ghost-btn" type="button" id="closeComposerBtn">Descartar entrada</button>
+                    <button class="ghost-btn" type="button" id="closeComposerBtn">${closeLabel}</button>
                     <button class="ghost-btn" type="button" id="saveDraftBtn">Guardar borrador</button>
-                    <button class="primary-btn" type="button" id="publishEntryBtn" ${canPublish ? '' : 'disabled'} title="${canPublish ? 'Publicar' : 'Inicia sesion para publicar'}">Publicar</button>
+                    <button class="primary-btn" type="button" id="publishEntryBtn" ${canPublish ? '' : 'disabled'} title="${publishTitle}">${publishLabel}</button>
                 </div>
             </header>
 
@@ -2011,6 +2438,8 @@ function renderEntryComposer(feedContent, context) {
 }
 
 function bindEntryComposerUi(context) {
+    const isEditingEntry = Boolean(context && context.mode === 'edit' && context.entryId);
+    const draftKey = getEntryDraftKey(context);
     const closeBtn = document.getElementById('closeComposerBtn');
     const saveDraftBtn = document.getElementById('saveDraftBtn');
     const publishBtn = document.getElementById('publishEntryBtn');
@@ -2026,7 +2455,11 @@ function bindEntryComposerUi(context) {
 
     if (closeBtn) {
         closeBtn.addEventListener('click', function() {
-            entryDraftsBySpot.delete(context.spotKey);
+            entryDraftsBySpot.delete(draftKey);
+            if (isEditingEntry) {
+                openEntryReader(context.entryId);
+                return;
+            }
             closeEntryComposer();
         });
     }
@@ -2043,13 +2476,23 @@ function bindEntryComposerUi(context) {
 
     if (publishBtn) {
         publishBtn.addEventListener('click', async function() {
-            if (!ensureManualAuth('publicar entradas')) {
+            const featureLabel = isEditingEntry ? 'editar entradas' : 'publicar entradas';
+            if (!ensureManualAuth(featureLabel)) {
                 return;
             }
+            const idleLabel = isEditingEntry ? 'Guardar cambios' : 'Publicar';
+            const pendingLabel = isEditingEntry ? 'Guardando...' : 'Publicando...';
             publishBtn.disabled = true;
+            publishBtn.textContent = pendingLabel;
             const published = await publishEntry(context, titleInput, editor);
             publishBtn.disabled = false;
+            publishBtn.textContent = idleLabel;
             if (!published) {
+                return;
+            }
+            entryDraftsBySpot.delete(draftKey);
+            if (isEditingEntry) {
+                openEntryReader(context.entryId);
                 return;
             }
             closeEntryComposer();
@@ -2171,19 +2614,21 @@ function bindEntryComposerUi(context) {
 
 function saveEntryDraft(context, titleInput, editor) {
     if (!context || !titleInput || !editor) return;
+    const draftKey = getEntryDraftKey(context);
 
-    entryDraftsBySpot.set(context.spotKey, {
+    entryDraftsBySpot.set(draftKey, {
         title: titleInput.value.trim(),
         content: editor.innerHTML.trim()
     });
 }
 
 async function publishEntry(context, titleInput, editor) {
-    if (!ensureManualAuth('publicar entradas')) {
+    if (!context || !titleInput || !editor) return false;
+    const isEditingEntry = Boolean(context.mode === 'edit' && context.entryId);
+    const featureLabel = isEditingEntry ? 'editar entradas' : 'publicar entradas';
+    if (!ensureManualAuth(featureLabel)) {
         return false;
     }
-
-    if (!context || !titleInput || !editor) return false;
 
     const title = titleInput.value.trim() || `Entrada en ${context.spotName}`;
     const html = editor.innerHTML.trim();
@@ -2194,11 +2639,48 @@ async function publishEntry(context, titleInput, editor) {
         return false;
     }
 
+    if (isEditingEntry) {
+        const entryIndex = publishedEntries.findIndex((item) => String(item.id) === String(context.entryId));
+        if (entryIndex < 0) {
+            window.alert('No se encontro la entrada para editar.');
+            return false;
+        }
+
+        const currentEntry = publishedEntries[entryIndex];
+        if (isBackendReady() && isPersistedEntry(currentEntry)) {
+            const { error } = await supabase
+                .from(SUPABASE_TABLES.entries)
+                .update({
+                    title,
+                    excerpt,
+                    content_html: html
+                })
+                .eq('id', currentEntry.id);
+
+            if (error) {
+                logSupabaseError('No se pudo editar la entrada', error);
+                window.alert('No se pudo guardar la edicion en Supabase.');
+                return false;
+            }
+        }
+
+        publishedEntries[entryIndex] = {
+            ...currentEntry,
+            title,
+            excerpt,
+            content: html
+        };
+        renderHomeEntriesFeed();
+        return true;
+    }
+
     const fallbackEntry = {
         id: nextLocalEntryKey(),
         spotKey: context.spotKey,
         spotName: context.spotName,
         title,
+        createdById: currentSessionUserId || null,
+        createdBy: currentManualUser || 'Anonimo',
         excerpt,
         content: html,
         createdAt: new Date()
@@ -2215,9 +2697,9 @@ async function publishEntry(context, titleInput, editor) {
                 title,
                 excerpt,
                 content_html: html,
-                created_by: createdBy
+                created_by: createdBy || null
             })
-            .select('id, spot_id, spot_name, title, excerpt, content_html, created_at')
+            .select('id, spot_id, spot_name, title, excerpt, content_html, created_at, created_by')
             .single();
 
         if (error) {
@@ -2239,32 +2721,60 @@ function renderHomeEntriesFeed() {
     const counter = document.getElementById('homeEntriesCount');
     if (!container) return;
 
+    const filteredEntries = activeEntriesSpotFilter
+        ? publishedEntries.filter((entry) => String(entry.spotKey) === activeEntriesSpotFilter.spotKey)
+        : publishedEntries;
+
     if (counter) {
-        counter.textContent = `${publishedEntries.length} publicadas`;
+        counter.textContent = activeEntriesSpotFilter
+            ? `${filteredEntries.length} de ${publishedEntries.length} publicadas`
+            : `${publishedEntries.length} publicadas`;
     }
 
-    if (!publishedEntries.length) {
+    const filterBanner = activeEntriesSpotFilter
+        ? `
+            <article class="home-entries-filter">
+                <p>Mostrando entradas de: <strong>${escapeHtml(activeEntriesSpotFilter.spotName)}</strong></p>
+                <button class="ghost-btn" type="button" id="clearEntriesFilterBtn">Mostrar todas</button>
+            </article>
+        `
+        : '';
+
+    if (!filteredEntries.length) {
         container.innerHTML = `
+            ${filterBanner}
             <article class="home-entry-empty">
-                <h4>Aún no hay entradas publicadas</h4>
-                <p>Publica tu primera historia y aparecerá aquí, con lo más reciente siempre arriba.</p>
+                <h4>${activeEntriesSpotFilter ? 'No hay entradas en este spot' : 'Aun no hay entradas publicadas'}</h4>
+                <p>${activeEntriesSpotFilter ? 'Quita el filtro para ver todas las entradas o publica una nueva en este spot.' : 'Publica tu primera historia y aparecera aqui, con lo mas reciente siempre arriba.'}</p>
             </article>
         `;
+
+        const clearFilterBtn = document.getElementById('clearEntriesFilterBtn');
+        if (clearFilterBtn) {
+            clearFilterBtn.addEventListener('click', clearEntriesFilter);
+        }
         return;
     }
 
-    container.innerHTML = publishedEntries
-        .map((entry) => `
+    container.innerHTML = `
+        ${filterBanner}
+        ${filteredEntries.map((entry) => `
             <article class="home-entry-card" data-published-entry-id="${entry.id}">
                 <div class="home-entry-meta">
                     <span>${escapeHtml(entry.spotName)}</span>
                     <span>${formatEntryDate(entry.createdAt)}</span>
                 </div>
+                <p class="entry-author">Por ${escapeHtml(entry.createdBy || 'Anonimo')}</p>
                 <h4>${escapeHtml(entry.title)}</h4>
                 <p>${escapeHtml(entry.excerpt)}${entry.excerpt.length >= 180 ? '...' : ''}</p>
             </article>
-        `)
-        .join('');
+        `).join('')}
+    `;
+
+    const clearFilterBtn = document.getElementById('clearEntriesFilterBtn');
+    if (clearFilterBtn) {
+        clearFilterBtn.addEventListener('click', clearEntriesFilter);
+    }
 
     Array.from(container.querySelectorAll('.home-entry-card')).forEach((card) => {
         card.addEventListener('click', function() {
@@ -2518,4 +3028,6 @@ function focusThread(threadId) {
 }
 
 window.addEventListener('DOMContentLoaded', initMap);
+
+
 
