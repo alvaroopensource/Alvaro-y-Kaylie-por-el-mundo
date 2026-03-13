@@ -80,7 +80,7 @@
                             <a class="nav-link" id="navGalleryLink" href="#" aria-disabled="true">Galería</a>
                             <a class="nav-link" href="#">Lugares</a>
                             <a class="nav-link" href="#">Recorridos</a>
-                            <a class="nav-link" href="#">Archivo</a>
+                            <a class="nav-link locked" id="navDraftsLink" href="#" aria-disabled="true" title="Inicia sesiÃ³n para abrir borradores">Borradores</a>
                         </div>
                     </nav>
                     <div class="forum-actions">
@@ -100,6 +100,15 @@
                 <section class="home-entries-section" aria-label="Entradas recientes">
                     <div class="home-entries-head">
                         <span id="homeEntriesCount">0 publicadas</span>
+                        <article class="home-entries-search">
+                            <input
+                                id="entriesSearchInput"
+                                class="home-entries-search-input"
+                                type="search"
+                                placeholder="Buscar entradas por titulo, spot o autor"
+                                autocomplete="off"
+                            >
+                        </article>
                     </div>
                     <div class="home-entries-feed" id="homeEntriesFeed"></div>
                 </section>
@@ -136,6 +145,17 @@
                     <button class="primary-btn" type="submit">Entrar</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <div class="auth-modal-overlay" id="noticeModalOverlay" hidden>
+        <div class="spot-modal notice-modal" role="dialog" aria-modal="true" aria-labelledby="noticeModalTitle">
+            <p class="spot-modal-kicker">Aviso</p>
+            <h2 id="noticeModalTitle">Notificacion</h2>
+            <p class="confirm-modal-copy" id="noticeModalCopy"></p>
+            <div class="spot-modal-actions">
+                <button class="primary-btn" id="noticeModalClose" type="button">Entendido</button>
+            </div>
         </div>
     </div>
 

@@ -17,7 +17,8 @@ const threads = [];
 const SUPABASE_TABLES = {
     spots: 'map_spots',
     entries: 'map_entries',
-    photos: 'map_photos'
+    photos: 'map_photos',
+    drafts: 'map_entry_drafts'
 };
 const SUPABASE_STORAGE = {
     galleryBucket: 'map-gallery'
@@ -27,6 +28,8 @@ const AUTH_USER_EMAILS = {
     Kaylie: 'kaylie@mi-mapa.com'
 };
 const AUTHOR_NAME_STORAGE_KEY = 'map-author-name-by-id';
+const ENTRY_DRAFTS_STORAGE_KEY = 'map-entry-drafts-v2';
+const ENTRY_EDITOR_PLACEHOLDER_HTML = '<p>Empieza a escribir aqui tu cronica...</p>';
 const SPOT_MARKER_SCALE_CONFIG = {
     minZoom: 10,
     maxZoom: 18,
@@ -48,15 +51,22 @@ let nextLocalSpotId = 1;
 const createdSpotMarkers = new Map();
 let pendingRenameSpotId = null;
 let pendingConfirmAction = null;
+let pendingConfirmResolver = null;
+let pendingConfirmAccepted = false;
 let activeComposerContext = null;
 let activeGalleryContext = null;
 let activeReadEntryId = null;
 let activeGlobalGalleryMode = false;
+let activeDraftsMode = false;
 let activeEntriesSpotFilter = null;
+let activeEntriesSearchQuery = '';
+let activeInlinePhotoEdit = null;
 let currentManualUser = null;
 let currentSessionUserId = null;
 let masonryResizeTimer = null;
 const entryDraftsBySpot = new Map();
+let isSyncingDraftsFromSupabase = false;
+let draftSyncCounter = 0;
 const galleryPhotosBySpot = new Map();
 const globalGalleryPhotos = [];
 const publishedEntries = [];
@@ -80,6 +90,7 @@ function initMap() {
         className: 'forum-tiles'
     }).addTo(map);
     bindSpotMarkerZoomScaling();
+    loadEntryDraftsFromStorage();
 
     renderCategories();
     renderThreads();
@@ -203,6 +214,306 @@ function rememberAuthorName(userId, userName) {
     persistKnownAuthorNamesById();
 }
 
+function loadEntryDraftsFromStorage() {
+    if (typeof window === 'undefined' || !window.localStorage) {
+        return;
+    }
+
+    try {
+        const raw = window.localStorage.getItem(ENTRY_DRAFTS_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return;
+
+        Object.entries(parsed).forEach(([draftKey, draftValue]) => {
+            if (!draftKey || !draftValue || typeof draftValue !== 'object') {
+                return;
+            }
+            entryDraftsBySpot.set(String(draftKey), {
+                title: String(draftValue.title || ''),
+                content: String(draftValue.content || ''),
+                spotKey: String(draftValue.spotKey || ''),
+                spotName: String(draftValue.spotName || 'Spot'),
+                owner: normalizeManualUserName(draftValue.owner) || 'Anonimo',
+                ownerKey: String(draftValue.ownerKey || ''),
+                mode: draftValue.mode === 'edit' ? 'edit' : 'compose',
+                entryId: draftValue.entryId ? String(draftValue.entryId) : null,
+                updatedAt: draftValue.updatedAt || new Date().toISOString()
+            });
+        });
+    } catch (_error) {
+        // Ignore malformed local storage payload.
+    }
+}
+
+function persistEntryDraftsToStorage() {
+    if (typeof window === 'undefined' || !window.localStorage) {
+        return;
+    }
+
+    const serializable = {};
+    entryDraftsBySpot.forEach((draftValue, draftKey) => {
+        serializable[String(draftKey)] = {
+            title: String(draftValue && draftValue.title ? draftValue.title : ''),
+            content: String(draftValue && draftValue.content ? draftValue.content : ''),
+            spotKey: String(draftValue && draftValue.spotKey ? draftValue.spotKey : ''),
+            spotName: String(draftValue && draftValue.spotName ? draftValue.spotName : 'Spot'),
+            owner: normalizeManualUserName(draftValue && draftValue.owner) || 'Anonimo',
+            ownerKey: String(draftValue && draftValue.ownerKey ? draftValue.ownerKey : ''),
+            mode: draftValue && draftValue.mode === 'edit' ? 'edit' : 'compose',
+            entryId: draftValue && draftValue.entryId ? String(draftValue.entryId) : null,
+            updatedAt: draftValue && draftValue.updatedAt ? draftValue.updatedAt : new Date().toISOString()
+        };
+    });
+    window.localStorage.setItem(ENTRY_DRAFTS_STORAGE_KEY, JSON.stringify(serializable));
+}
+
+function getDraftOwnerName() {
+    return normalizeManualUserName(currentManualUser) || 'Anonimo';
+}
+
+function getDraftOwnerKey() {
+    return getDraftOwnerName().toLowerCase();
+}
+
+function createLocalComposeDraftKey(spotKey, ownerKey = getDraftOwnerKey()) {
+    const safeSpotKey = String(spotKey || 'draft');
+    const safeOwnerKey = String(ownerKey || 'anonimo');
+    const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return `${safeOwnerKey}::compose:${safeSpotKey}:${nonce}`;
+}
+
+function toRemoteDraftKey(localDraftKey, ownerKey = getDraftOwnerKey()) {
+    const raw = String(localDraftKey || '');
+    const prefix = `${ownerKey}::`;
+    if (raw.startsWith(prefix)) {
+        return raw.slice(prefix.length);
+    }
+
+    const otherOwnerMatch = raw.match(/^[^:]+::(.+)$/);
+    if (otherOwnerMatch && otherOwnerMatch[1]) {
+        return otherOwnerMatch[1];
+    }
+
+    return raw;
+}
+
+function toLocalDraftKey(remoteDraftKey, ownerKey = getDraftOwnerKey()) {
+    const normalizedOwnerKey = String(ownerKey || 'anonimo');
+    const raw = String(remoteDraftKey || '');
+    const prefix = `${normalizedOwnerKey}::`;
+    if (raw.startsWith(prefix)) {
+        return raw;
+    }
+    return `${prefix}${raw || 'spot:draft'}`;
+}
+
+function isCurrentComposerDirty() {
+    const titleInput = document.getElementById('entryTitleInput');
+    const editor = document.getElementById('entryBodyEditor');
+    if (!titleInput || !editor) {
+        return false;
+    }
+
+    if (String(titleInput.value || '').trim()) {
+        return true;
+    }
+
+    const currentHtml = String(editor.innerHTML || '').trim();
+    if (!currentHtml || currentHtml === ENTRY_EDITOR_PLACEHOLDER_HTML) {
+        return false;
+    }
+
+    const plainText = getPlainTextFromHtml(currentHtml);
+    return plainText && plainText !== 'Empieza a escribir aqui tu cronica...';
+}
+
+function mapDraftRowToLocalDraft(draftRow, ownerName, ownerKey) {
+    const remoteDraftKey = toRemoteDraftKey(draftRow.draft_key, ownerKey);
+    const inferredMode = remoteDraftKey.startsWith('entry:') ? 'edit' : 'compose';
+    const inferredEntryId = inferredMode === 'edit' ? remoteDraftKey.slice('entry:'.length) : null;
+    const inferredSpotKey = remoteDraftKey.startsWith('spot:')
+        ? remoteDraftKey.slice('spot:'.length)
+        : String(draftRow.spot_key || 'draft');
+
+    return {
+        localDraftKey: toLocalDraftKey(remoteDraftKey, ownerKey),
+        value: {
+            title: String(draftRow.title || ''),
+            content: String(draftRow.content_html || ''),
+            spotKey: String(inferredSpotKey || 'draft'),
+            spotName: String(draftRow.spot_name || 'Spot'),
+            owner: ownerName,
+            ownerKey,
+            mode: inferredMode,
+            entryId: inferredEntryId ? String(inferredEntryId) : null,
+            updatedAt: draftRow.updated_at || new Date().toISOString()
+        }
+    };
+}
+
+async function syncEntryDraftsFromSupabase(options = {}) {
+    if (isSyncingDraftsFromSupabase) {
+        return;
+    }
+    if (!isBackendReady() || !isManualAuthenticated()) {
+        return;
+    }
+
+    const userId = await getCurrentUserId();
+    if (!userId) {
+        return;
+    }
+
+    const shouldRender = Boolean(options.render);
+    const ownerName = getDraftOwnerName();
+    const ownerKey = getDraftOwnerKey();
+    const syncId = ++draftSyncCounter;
+    isSyncingDraftsFromSupabase = true;
+
+    const { data, error } = await supabase
+        .from(SUPABASE_TABLES.drafts)
+        .select('draft_key, spot_key, spot_name, title, content_html, updated_at')
+        .eq('created_by', userId)
+        .order('updated_at', { ascending: false });
+
+    isSyncingDraftsFromSupabase = false;
+
+    if (syncId !== draftSyncCounter) {
+        return;
+    }
+
+    if (error) {
+        logSupabaseError('No se pudieron sincronizar borradores', error);
+        return;
+    }
+
+    let changed = false;
+    (data || []).forEach((draftRow) => {
+        const mapped = mapDraftRowToLocalDraft(draftRow, ownerName, ownerKey);
+        const existing = entryDraftsBySpot.get(mapped.localDraftKey);
+        const nextUpdatedAt = new Date(mapped.value.updatedAt).getTime();
+        const existingUpdatedAt = existing && existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+        if (!existing || nextUpdatedAt >= existingUpdatedAt) {
+            entryDraftsBySpot.set(mapped.localDraftKey, mapped.value);
+            changed = true;
+        }
+    });
+
+    if (changed) {
+        persistEntryDraftsToStorage();
+        if (shouldRender || activeDraftsMode) {
+            renderThreads();
+        }
+    }
+}
+
+async function hydrateEntryDraftForComposer(context) {
+    if (!context || !isBackendReady() || !isManualAuthenticated()) {
+        return;
+    }
+
+    const ownerKey = getDraftOwnerKey();
+    const localDraftKey = getEntryDraftKey(context, ownerKey);
+    if (entryDraftsBySpot.has(localDraftKey)) {
+        return;
+    }
+
+    const userId = await getCurrentUserId();
+    if (!userId) {
+        return;
+    }
+
+    const remoteDraftKey = toRemoteDraftKey(localDraftKey, ownerKey);
+    const { data, error } = await supabase
+        .from(SUPABASE_TABLES.drafts)
+        .select('draft_key, spot_key, spot_name, title, content_html, updated_at')
+        .eq('created_by', userId)
+        .eq('draft_key', remoteDraftKey)
+        .maybeSingle();
+
+    if (error) {
+        logSupabaseError('No se pudo cargar el borrador', error);
+        return;
+    }
+
+    if (!data) {
+        return;
+    }
+
+    const activeKey = activeComposerContext ? getEntryDraftKey(activeComposerContext, ownerKey) : null;
+    if (activeKey !== localDraftKey) {
+        return;
+    }
+
+    if (isCurrentComposerDirty()) {
+        return;
+    }
+
+    const mapped = mapDraftRowToLocalDraft(data, getDraftOwnerName(), ownerKey);
+    entryDraftsBySpot.set(mapped.localDraftKey, mapped.value);
+    persistEntryDraftsToStorage();
+    renderThreads();
+}
+
+async function upsertEntryDraftToSupabase(localDraftKey, draftValue) {
+    if (!isBackendReady() || !isManualAuthenticated() || !draftValue) {
+        return false;
+    }
+
+    const userId = await getCurrentUserId();
+    if (!userId) {
+        return false;
+    }
+
+    const ownerKey = String(draftValue.ownerKey || getDraftOwnerKey());
+    const remoteDraftKey = toRemoteDraftKey(localDraftKey, ownerKey);
+    const payload = {
+        draft_key: remoteDraftKey,
+        spot_key: String(draftValue.spotKey || 'draft'),
+        spot_name: String(draftValue.spotName || 'Spot'),
+        title: String(draftValue.title || ''),
+        content_html: String(draftValue.content || ''),
+        created_by: userId
+    };
+
+    const { error } = await supabase
+        .from(SUPABASE_TABLES.drafts)
+        .upsert(payload, { onConflict: 'created_by,draft_key' });
+
+    if (error) {
+        logSupabaseError('No se pudo guardar el borrador en Supabase', error);
+        return false;
+    }
+
+    return true;
+}
+
+async function deleteEntryDraftFromSupabase(localDraftKey, ownerKey = getDraftOwnerKey()) {
+    if (!isBackendReady() || !isManualAuthenticated()) {
+        return false;
+    }
+
+    const userId = await getCurrentUserId();
+    if (!userId) {
+        return false;
+    }
+
+    const remoteDraftKey = toRemoteDraftKey(localDraftKey, ownerKey);
+    const { error } = await supabase
+        .from(SUPABASE_TABLES.drafts)
+        .delete()
+        .eq('created_by', userId)
+        .eq('draft_key', remoteDraftKey);
+
+    if (error) {
+        logSupabaseError('No se pudo eliminar el borrador en Supabase', error);
+        return false;
+    }
+
+    return true;
+}
+
 function resolveEntryAuthorName(createdBy, fallbackName) {
     const fallbackCanonical = normalizeManualUserName(fallbackName);
     if (fallbackCanonical) {
@@ -258,7 +569,7 @@ function ensureManualAuth(featureLabel) {
     }
 
     const suffix = featureLabel ? ` para ${featureLabel}` : '';
-    window.alert(`Debes iniciar sesion${suffix}.`);
+    notify(`Debes iniciar sesion${suffix}.`, 'Acceso requerido');
     openAuthModal();
     return false;
 }
@@ -285,6 +596,9 @@ async function hydrateAuthState() {
     }
     refreshPublishedEntriesAuthorNames();
     updateLoginButtonState();
+    if (currentSessionUserId && currentManualUser) {
+        void syncEntryDraftsFromSupabase({ render: activeDraftsMode });
+    }
 
     supabase.auth.onAuthStateChange((_event, session) => {
         const nextUser = session && session.user ? session.user : null;
@@ -297,6 +611,9 @@ async function hydrateAuthState() {
         }
         refreshPublishedEntriesAuthorNames();
         updateLoginButtonState();
+        if (currentSessionUserId && currentManualUser) {
+            void syncEntryDraftsFromSupabase({ render: activeDraftsMode || Boolean(activeComposerContext) });
+        }
     });
 }
 
@@ -311,6 +628,37 @@ function nextLocalEntryKey() {
 function logSupabaseError(action, error) {
     const message = error && error.message ? error.message : error;
     console.error(`[Supabase] ${action}`, message);
+}
+
+function notify(message, title = 'Notificacion') {
+    const overlay = document.getElementById('noticeModalOverlay');
+    const titleNode = document.getElementById('noticeModalTitle');
+    const copyNode = document.getElementById('noticeModalCopy');
+    if (!overlay || !copyNode) {
+        console.warn('[notify] Modal no disponible:', message);
+        return;
+    }
+
+    if (titleNode) {
+        titleNode.textContent = title;
+    }
+    copyNode.textContent = String(message || '');
+    overlay.hidden = false;
+}
+
+function closeNoticeModal() {
+    const overlay = document.getElementById('noticeModalOverlay');
+    const titleNode = document.getElementById('noticeModalTitle');
+    const copyNode = document.getElementById('noticeModalCopy');
+    if (overlay) {
+        overlay.hidden = true;
+    }
+    if (titleNode) {
+        titleNode.textContent = 'Notificacion';
+    }
+    if (copyNode) {
+        copyNode.textContent = '';
+    }
 }
 
 function mapEntryRecordToViewModel(entryRecord, fallback = {}) {
@@ -632,9 +980,12 @@ function bindStaticUi() {
     const authModalOverlay = document.getElementById('authModalOverlay');
     const authModalCancel = document.getElementById('authModalCancel');
     const authModalForm = document.getElementById('authModalForm');
+    const noticeModalOverlay = document.getElementById('noticeModalOverlay');
+    const noticeModalClose = document.getElementById('noticeModalClose');
     const toggleAuthPassword = document.getElementById('toggleAuthPassword');
     const navHomeLink = document.getElementById('navHomeLink');
     const navGalleryLink = document.getElementById('navGalleryLink');
+    const navDraftsLink = document.getElementById('navDraftsLink');
 
     map.on('mousemove', function(event) {
         if (!isDraftPlacementMode || !event.containerPoint) return;
@@ -712,8 +1063,12 @@ function bindStaticUi() {
 
     if (confirmModalAccept) {
         confirmModalAccept.addEventListener('click', function() {
+            pendingConfirmAccepted = true;
             if (pendingConfirmAction) {
                 pendingConfirmAction();
+            }
+            if (pendingConfirmResolver) {
+                pendingConfirmResolver(true);
             }
             closeConfirmModal();
         });
@@ -735,6 +1090,18 @@ function bindStaticUi() {
         authModalForm.addEventListener('submit', handleAuthModalSubmit);
     }
 
+    if (noticeModalClose) {
+        noticeModalClose.addEventListener('click', closeNoticeModal);
+    }
+
+    if (noticeModalOverlay) {
+        noticeModalOverlay.addEventListener('click', function(event) {
+            if (event.target === noticeModalOverlay) {
+                closeNoticeModal();
+            }
+        });
+    }
+
     if (toggleAuthPassword) {
         toggleAuthPassword.addEventListener('click', toggleAuthPasswordVisibility);
     }
@@ -748,6 +1115,7 @@ function bindStaticUi() {
             activeComposerContext = null;
             activeGalleryContext = null;
             activeReadEntryId = null;
+            activeDraftsMode = false;
             setNavMode('home');
             renderThreads();
         });
@@ -756,10 +1124,28 @@ function bindStaticUi() {
     if (navGalleryLink) {
         navGalleryLink.addEventListener('click', function(event) {
             event.preventDefault();
-            if (!ensureManualAuth('abrir la galería')) {
+            if (!ensureManualAuth('abrir la galerÃ­a')) {
                 return;
             }
             openGlobalGalleryPane();
+        });
+    }
+
+    if (navDraftsLink) {
+        navDraftsLink.addEventListener('click', function(event) {
+            event.preventDefault();
+            if (!ensureManualAuth('abrir borradores')) {
+                return;
+            }
+            openDraftsPane();
+        });
+    }
+
+    const entriesSearchInput = document.getElementById('entriesSearchInput');
+    if (entriesSearchInput) {
+        entriesSearchInput.addEventListener('input', function(event) {
+            activeEntriesSearchQuery = event.target.value || '';
+            renderHomeEntriesFeed();
         });
     }
 
@@ -946,10 +1332,9 @@ function createDraftLocationIcon() {
             <div class="draft-location-shell">
                 <div class="draft-location-actions">
                     <button type="button" class="draft-location-action draft-location-action-primary" data-draft-action="write" aria-label="Nueva entrada" title="Nueva entrada">
-                        <span class="draft-action-icon" aria-hidden="true">✎</span>
+                        <span class="draft-action-icon" aria-hidden="true">+</span>
                     </button>
                     <button type="button" class="draft-location-action" data-draft-action="entries">Entradas</button>
-                    <button type="button" class="draft-location-action" data-draft-action="gallery">Galeria</button>
                     <button type="button" class="draft-location-action" data-draft-action="rename">Renombrar</button>
                     <button type="button" class="draft-location-action" data-draft-action="remove">Eliminar</button>
                 </div>
@@ -971,10 +1356,9 @@ function createSavedSpotIcon(spotName, spotId) {
             <div class="draft-location-shell saved-spot-shell">
                 <div class="draft-location-actions">
                     <button type="button" class="draft-location-action draft-location-action-primary" data-created-action="new-entry" data-spot-id="${spotId}" aria-label="Nueva entrada" title="Nueva entrada">
-                        <span class="draft-action-icon" aria-hidden="true">✎</span>
+                        <span class="draft-action-icon" aria-hidden="true">+</span>
                     </button>
                     <button type="button" class="draft-location-action" data-created-action="entries" data-spot-id="${spotId}">Entradas</button>
-                    <button type="button" class="draft-location-action" data-created-action="gallery" data-spot-id="${spotId}">Galeria</button>
                     <button type="button" class="draft-location-action" data-created-action="rename" data-spot-id="${spotId}">Renombrar</button>
                     <button type="button" class="draft-location-action" data-created-action="remove" data-spot-id="${spotId}">Eliminar</button>
                 </div>
@@ -1082,7 +1466,7 @@ async function finalizeDraftSpot() {
     if (isBackendReady()) {
         const createdBy = await getCurrentUserId();
         if (!createdBy) {
-            window.alert('Para crear spots necesitas iniciar sesion con una cuenta autenticada en Supabase.');
+            notify('Para crear spots necesitas iniciar sesion con una cuenta autenticada en Supabase.', 'Acceso requerido');
             openAuthModal();
             return false;
         }
@@ -1099,14 +1483,14 @@ async function finalizeDraftSpot() {
 
         if (error) {
             logSupabaseError('No se pudo guardar el spot', error);
-            window.alert('No se pudo guardar el spot. Verifica tu sesion y permisos.');
+            notify('No se pudo guardar el spot. Verifica tu sesion y permisos.', 'Error al guardar');
             return false;
         } else {
             spotId = String(data.id);
             persisted = true;
         }
     } else {
-        window.alert('La configuracion de Supabase no esta lista. No se pueden crear spots.');
+        notify('La configuracion de Supabase no esta lista. No se pueden crear spots.', 'Configuracion');
         return false;
     }
 
@@ -1152,7 +1536,8 @@ function handleDraftLocationActionClick(event) {
         openEntryComposer({
             spotName: draftSpotName || 'Nuevo spot',
             spotKey: 'draft',
-            latlng
+            latlng,
+            forceNew: true
         });
         updateComposerLocation(latlng, 'Nueva entrada en');
         closeAllSpotMenus();
@@ -1240,7 +1625,8 @@ function handleCreatedSpotActionClick(event) {
         openEntryComposer({
             spotName: name,
             spotKey: spotId,
-            latlng
+            latlng,
+            forceNew: true
         });
         updateComposerLocation(latlng, `Nueva entrada en ${name}`);
         closeAllSpotMenus();
@@ -1367,28 +1753,55 @@ function closeAllSpotMenus() {
     });
 }
 
-function openConfirmModal(message, onConfirm) {
+function openConfirmModal(message, onConfirm, options = {}) {
     const overlay = document.getElementById('confirmModalOverlay');
     const copy = document.getElementById('confirmModalCopy');
+    const title = document.getElementById('confirmModalTitle');
+    const accept = document.getElementById('confirmModalAccept');
     if (!overlay || !copy) {
         return;
     }
 
+    const modalTitle = options.title || 'Confirmacion';
+    const acceptLabel = options.acceptLabel || 'Eliminar';
+    overlay.classList.toggle('is-right-confirm', options.side === 'right');
     copy.textContent = message;
+    if (title) {
+        title.textContent = modalTitle;
+    }
+    if (accept) {
+        accept.textContent = acceptLabel;
+    }
     pendingConfirmAction = onConfirm;
+    pendingConfirmResolver = typeof options.onDecision === 'function' ? options.onDecision : null;
+    pendingConfirmAccepted = false;
     overlay.hidden = false;
 }
 
 function closeConfirmModal() {
     const overlay = document.getElementById('confirmModalOverlay');
     const copy = document.getElementById('confirmModalCopy');
+    const title = document.getElementById('confirmModalTitle');
+    const accept = document.getElementById('confirmModalAccept');
     if (overlay) {
         overlay.hidden = true;
+        overlay.classList.remove('is-right-confirm');
     }
     if (copy) {
         copy.textContent = '';
     }
+    if (title) {
+        title.textContent = 'Confirmacion';
+    }
+    if (accept) {
+        accept.textContent = 'Eliminar';
+    }
+    if (pendingConfirmResolver && !pendingConfirmAccepted) {
+        pendingConfirmResolver(false);
+    }
     pendingConfirmAction = null;
+    pendingConfirmResolver = null;
+    pendingConfirmAccepted = false;
 }
 
 function openAuthModal() {
@@ -1426,7 +1839,7 @@ function closeAuthModal() {
     if (toggleButton) {
         toggleButton.textContent = 'Ver';
         toggleButton.setAttribute('aria-pressed', 'false');
-        toggleButton.setAttribute('aria-label', 'Mostrar contraseña');
+        toggleButton.setAttribute('aria-label', 'Mostrar contraseÃ±a');
     }
 }
 
@@ -1442,24 +1855,24 @@ async function handleAuthModalSubmit(event) {
     }
 
     if (!isBackendReady()) {
-        window.alert('Configura Supabase para iniciar sesion.');
+        notify('Configura Supabase para iniciar sesion.', 'Configuracion');
         return;
     }
 
     const selectedUserName = userInput.value.trim();
     if (!selectedUserName) {
-        window.alert('Selecciona un usuario para iniciar sesion.');
+        notify('Selecciona un usuario para iniciar sesion.', 'Acceso');
         return;
     }
 
     const email = getAuthEmailForUser(selectedUserName);
     if (!email) {
-        window.alert('No existe un correo configurado para este usuario. Revisa AUTH_USER_EMAILS en map.js.');
+        notify('No existe un correo configurado para este usuario. Revisa AUTH_USER_EMAILS en map.js.', 'Configuracion');
         return;
     }
 
     if (email.toLowerCase().endsWith('@tu-dominio.com')) {
-        window.alert('Debes actualizar AUTH_USER_EMAILS en map.js con los correos reales de Supabase Auth.');
+        notify('Debes actualizar AUTH_USER_EMAILS en map.js con los correos reales de Supabase Auth.', 'Configuracion');
         return;
     }
 
@@ -1483,7 +1896,7 @@ async function handleAuthModalSubmit(event) {
     }
 
     if (error || !data || !data.user) {
-        window.alert(`No se pudo iniciar sesion: ${error ? error.message : 'credenciales invalidas'}`);
+        notify(`No se pudo iniciar sesion: ${error ? error.message : 'credenciales invalidas'}`, 'Acceso');
         return;
     }
 
@@ -1500,6 +1913,7 @@ async function handleAuthModalSubmit(event) {
 function updateLoginButtonState() {
     const loginLauncher = document.getElementById('loginLauncher');
     const galleryLink = document.getElementById('navGalleryLink');
+    const draftsLink = document.getElementById('navDraftsLink');
     if (!loginLauncher) return;
 
     if (currentManualUser) {
@@ -1511,6 +1925,11 @@ function updateLoginButtonState() {
             galleryLink.setAttribute('aria-disabled', 'false');
             galleryLink.removeAttribute('title');
         }
+        if (draftsLink) {
+            draftsLink.classList.remove('locked');
+            draftsLink.setAttribute('aria-disabled', 'false');
+            draftsLink.removeAttribute('title');
+        }
     } else {
         loginLauncher.setAttribute('title', 'Iniciar sesion');
         loginLauncher.setAttribute('aria-label', 'Iniciar sesion');
@@ -1518,17 +1937,27 @@ function updateLoginButtonState() {
         if (galleryLink) {
             galleryLink.classList.add('locked');
             galleryLink.setAttribute('aria-disabled', 'true');
-            galleryLink.setAttribute('title', 'Inicia sesión para abrir la galería');
+            galleryLink.setAttribute('title', 'Inicia sesion para abrir la galeria');
+        }
+        if (draftsLink) {
+            draftsLink.classList.add('locked');
+            draftsLink.setAttribute('aria-disabled', 'true');
+            draftsLink.setAttribute('title', 'Inicia sesion para abrir borradores');
         }
         if (activeGlobalGalleryMode) {
             activeGlobalGalleryMode = false;
         }
+        if (activeDraftsMode) {
+            activeDraftsMode = false;
+        }
     }
 
-    if (!activeGlobalGalleryMode) {
-        setNavMode('home');
-    } else {
+    if (activeGlobalGalleryMode) {
         setNavMode('gallery');
+    } else if (activeDraftsMode) {
+        setNavMode('drafts');
+    } else {
+        setNavMode('home');
     }
     renderThreads();
 }
@@ -1544,7 +1973,7 @@ function toggleAuthPasswordVisibility() {
     passwordInput.type = nextVisible ? 'text' : 'password';
     toggleButton.textContent = nextVisible ? 'Ocultar' : 'Ver';
     toggleButton.setAttribute('aria-pressed', nextVisible ? 'true' : 'false');
-    toggleButton.setAttribute('aria-label', nextVisible ? 'Ocultar contraseña' : 'Mostrar contraseña');
+    toggleButton.setAttribute('aria-label', nextVisible ? 'Ocultar contraseÃ±a' : 'Mostrar contraseÃ±a');
 }
 
 function renderCategories() {
@@ -1579,6 +2008,7 @@ function renderThreads() {
         document.body.classList.remove('gallery-mode');
         document.body.classList.remove('read-mode');
         document.body.classList.remove('global-gallery-mode');
+        document.body.classList.remove('drafts-mode');
         renderEntryComposer(feedContent, activeComposerContext);
         return;
     }
@@ -1588,6 +2018,7 @@ function renderThreads() {
         document.body.classList.add('gallery-mode');
         document.body.classList.remove('read-mode');
         document.body.classList.remove('global-gallery-mode');
+        document.body.classList.remove('drafts-mode');
         renderGalleryPane(feedContent, activeGalleryContext);
         return;
     }
@@ -1597,7 +2028,18 @@ function renderThreads() {
         document.body.classList.remove('gallery-mode');
         document.body.classList.remove('read-mode');
         document.body.classList.add('global-gallery-mode');
+        document.body.classList.remove('drafts-mode');
         renderGlobalGalleryPane(feedContent);
+        return;
+    }
+
+    if (activeDraftsMode) {
+        document.body.classList.remove('compose-mode');
+        document.body.classList.remove('gallery-mode');
+        document.body.classList.remove('read-mode');
+        document.body.classList.remove('global-gallery-mode');
+        document.body.classList.add('drafts-mode');
+        renderDraftsPane(feedContent);
         return;
     }
 
@@ -1606,6 +2048,7 @@ function renderThreads() {
         document.body.classList.remove('gallery-mode');
         document.body.classList.add('read-mode');
         document.body.classList.remove('global-gallery-mode');
+        document.body.classList.remove('drafts-mode');
         renderEntryReaderPane(feedContent, activeReadEntryId);
         return;
     }
@@ -1614,6 +2057,7 @@ function renderThreads() {
     document.body.classList.remove('gallery-mode');
     document.body.classList.remove('read-mode');
     document.body.classList.remove('global-gallery-mode');
+    document.body.classList.remove('drafts-mode');
 
     if (feedCount) feedCount.textContent = `${threads.length} publicadas`;
     feedContent.innerHTML = threads
@@ -1653,10 +2097,16 @@ function renderThreads() {
 }
 
 function openEntryComposer(context) {
-    activeComposerContext = context;
+    const nextContext = { ...(context || {}) };
+    if (nextContext.forceNew && !nextContext.draftKey) {
+        nextContext.draftKey = createLocalComposeDraftKey(nextContext.spotKey);
+    }
+
+    activeComposerContext = nextContext;
     activeGalleryContext = null;
     activeReadEntryId = null;
     activeGlobalGalleryMode = false;
+    activeDraftsMode = false;
     document.body.classList.add('compose-mode');
     document.body.classList.remove('gallery-mode');
     document.body.classList.remove('read-mode');
@@ -1687,11 +2137,13 @@ function openGalleryPane(context) {
     activeComposerContext = null;
     activeReadEntryId = null;
     activeGlobalGalleryMode = false;
+    activeDraftsMode = false;
     document.body.classList.remove('compose-mode');
     document.body.classList.add('gallery-mode');
     document.body.classList.remove('read-mode');
     setNavMode('home');
     renderThreads();
+    void hydrateEntryDraftForComposer(context);
 
     const feedContent = document.getElementById('feedContent');
     if (feedContent) {
@@ -1710,6 +2162,7 @@ function openEntryReader(entryId) {
     activeComposerContext = null;
     activeGalleryContext = null;
     activeGlobalGalleryMode = false;
+    activeDraftsMode = false;
     document.body.classList.remove('compose-mode');
     document.body.classList.remove('gallery-mode');
     document.body.classList.add('read-mode');
@@ -1740,8 +2193,18 @@ function isPersistedEntry(entry) {
 
 function confirmEntryDeletion(entryTitle) {
     const safeTitle = entryTitle ? `"${entryTitle}"` : 'esta entrada';
-    window.alert(`Vas a eliminar ${safeTitle}.`);
-    return window.confirm(`Seguro que deseas eliminar ${safeTitle}? Esta accion no se puede deshacer.`);
+    return new Promise((resolve) => {
+        openConfirmModal(
+            `Seguro que deseas eliminar ${safeTitle}? Esta accion no se puede deshacer.`,
+            null,
+            {
+                title: 'Eliminar entrada?',
+                acceptLabel: 'Eliminar',
+                side: 'right',
+                onDecision: resolve
+            }
+        );
+    });
 }
 
 async function editPublishedEntry(entryId) {
@@ -1773,7 +2236,7 @@ async function removePublishedEntry(entryId) {
     }
 
     const target = publishedEntries[index];
-    if (!confirmEntryDeletion(target.title)) {
+    if (!(await confirmEntryDeletion(target.title))) {
         return;
     }
 
@@ -1785,12 +2248,18 @@ async function removePublishedEntry(entryId) {
 
         if (error) {
             logSupabaseError('No se pudo eliminar la entrada', error);
-            window.alert('No se pudo eliminar la entrada en Supabase.');
+            notify('No se pudo eliminar la entrada en Supabase.', 'Error al eliminar');
             return;
         }
     }
 
     publishedEntries.splice(index, 1);
+    void removeEntryDraft({
+        mode: 'edit',
+        entryId: String(target.id),
+        spotKey: String(target.spotKey || 'draft'),
+        spotName: String(target.spotName || 'Spot')
+    });
     renderHomeEntriesFeed();
 
     if (activeReadEntryId && String(activeReadEntryId) === String(entryId)) {
@@ -1803,6 +2272,7 @@ async function removePublishedEntry(entryId) {
 
 function openGlobalGalleryPane() {
     activeGlobalGalleryMode = true;
+    activeDraftsMode = false;
     activeComposerContext = null;
     activeGalleryContext = null;
     activeReadEntryId = null;
@@ -1813,43 +2283,173 @@ function openGlobalGalleryPane() {
     renderThreads();
 }
 
+function openDraftsPane() {
+    if (!ensureManualAuth('abrir borradores')) {
+        return;
+    }
+
+    activeGlobalGalleryMode = false;
+    activeDraftsMode = true;
+    activeComposerContext = null;
+    activeGalleryContext = null;
+    activeReadEntryId = null;
+    document.body.classList.remove('compose-mode');
+    document.body.classList.remove('gallery-mode');
+    document.body.classList.remove('read-mode');
+    document.body.classList.remove('global-gallery-mode');
+    setNavMode('drafts');
+    renderThreads();
+    void syncEntryDraftsFromSupabase({ render: true });
+}
+
+function getVisibleDraftEntries() {
+    const ownerName = getDraftOwnerName();
+    const ownerKey = getDraftOwnerKey();
+    const entries = [];
+
+    entryDraftsBySpot.forEach((draft, draftKey) => {
+        if (!draft || !draftKey) return;
+        const draftOwnerKey = String(draft.ownerKey || '');
+        const draftOwnerName = normalizeManualUserName(draft.owner) || 'Anonimo';
+        if (draftOwnerKey !== ownerKey && draftOwnerName !== ownerName) {
+            return;
+        }
+        const plainText = getPlainTextFromHtml(String(draft.content || ''));
+        entries.push({
+            key: String(draftKey),
+            title: String(draft.title || '').trim() || `Borrador en ${draft.spotName || 'Spot'}`,
+            spotName: String(draft.spotName || 'Spot'),
+            updatedAt: draft.updatedAt || new Date().toISOString(),
+            excerpt: plainText.slice(0, 180),
+            mode: draft.mode === 'edit' ? 'edit' : 'compose',
+            entryId: draft.entryId ? String(draft.entryId) : null,
+            spotKey: String(draft.spotKey || 'draft')
+        });
+    });
+
+    entries.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    return entries;
+}
+
+function renderDraftsPane(feedContent) {
+    const drafts = getVisibleDraftEntries();
+
+    feedContent.innerHTML = `
+        <section class="drafts-panel" aria-label="Borradores guardados">
+            <header class="gallery-head">
+                <div>
+                    <p class="gallery-kicker">Borradores</p>
+                    <p class="gallery-count">${drafts.length} borrador${drafts.length === 1 ? '' : 'es'}</p>
+                </div>
+            </header>
+            <div class="home-entries-feed">
+                ${drafts.length
+                    ? drafts.map((draft) => `
+                        <article class="home-entry-card" data-open-draft-key="${escapeHtml(draft.key)}">
+                            <div class="home-entry-meta">
+                                <span>${escapeHtml(draft.spotName)}</span>
+                                <span>${formatEntryDate(draft.updatedAt)}</span>
+                            </div>
+                            <h4>${escapeHtml(draft.title)}</h4>
+                            <p>${escapeHtml(draft.excerpt)}${draft.excerpt.length >= 180 ? '...' : ''}</p>
+                        </article>
+                    `).join('')
+                    : `
+                        <article class="home-entry-empty">
+                            <h4>No tienes borradores</h4>
+                            <p>Guarda una entrada como borrador y aparecera aqui.</p>
+                        </article>
+                    `
+                }
+            </div>
+        </section>
+    `;
+
+    Array.from(feedContent.querySelectorAll('[data-open-draft-key]')).forEach((card) => {
+        card.addEventListener('click', function() {
+            const draftKey = card.dataset.openDraftKey;
+            if (!draftKey) return;
+            const draft = entryDraftsBySpot.get(draftKey);
+            if (!draft) return;
+            const context = {
+                spotKey: String(draft.spotKey || 'draft'),
+                spotName: String(draft.spotName || 'Spot'),
+                draftKey: String(draftKey)
+            };
+            if (draft.mode === 'edit' && draft.entryId) {
+                context.mode = 'edit';
+                context.entryId = String(draft.entryId);
+            }
+            openEntryComposer(context);
+        });
+    });
+}
+
 function renderGlobalGalleryPane(feedContent) {
     const canUpload = isManualAuthenticated();
 
-    feedContent.innerHTML = `
-        <section class="gallery-panel global-gallery-panel" aria-label="Galería general">
+    feedContent.innerHTML =         `
+        <section class="gallery-panel global-gallery-panel" aria-label="Galeria general">
             <header class="gallery-head">
                 <div>
-                    <p class="gallery-kicker">Galería</p>
+                    <p class="gallery-kicker">Galeria</p>
                     <p class="gallery-count">${globalGalleryPhotos.length} foto${globalGalleryPhotos.length === 1 ? '' : 's'}</p>
                 </div>
                 <div class="gallery-head-actions">
-                    <button class="primary-btn" type="button" id="addGlobalGalleryPhotoBtn" ${canUpload ? '' : 'disabled'} title="${canUpload ? 'Agregar fotos' : 'Inicia sesión para agregar fotos'}">Agregar fotos</button>
+                    <button class="primary-btn" type="button" id="addGlobalGalleryPhotoBtn" ${canUpload ? '' : 'disabled'} title="${canUpload ? 'Agregar fotos' : 'Inicia sesion para agregar fotos'}">Agregar fotos</button>
                     <input id="globalGalleryPhotoInput" type="file" accept="image/*" multiple hidden>
                 </div>
             </header>
 
             <div class="gallery-feed gallery-view-pinterest">
                 ${globalGalleryPhotos.length
-                    ? globalGalleryPhotos.map((photo) => `
-                        <article class="gallery-item" data-global-photo-id="${photo.id}">
-                            <img src="${photo.src}" alt="${escapeHtml(photo.name || 'Foto de galería')}">
+                    ? globalGalleryPhotos.map((photo) => {
+                        const isEditing = isInlinePhotoEditing('global', null, photo.id);
+                        const editName = isEditing ? activeInlinePhotoEdit.name : String(photo.name || 'Foto');
+                        const editDescription = isEditing ? activeInlinePhotoEdit.description : String(photo.description || '');
+                        return `
+                        <article class="gallery-item ${isEditing ? 'is-inline-editing' : ''}" data-global-photo-id="${photo.id}">
+                            <img src="${photo.src}" alt="${escapeHtml(photo.name || 'Foto de galeria')}">
                             <div class="gallery-item-meta">
-                                <strong>${escapeHtml(photo.name || 'Foto')}</strong>
-                                ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
-                                <span>${escapeHtml(photo.addedAt || '')}</span>
+                                ${isEditing ? `
+                                    <div class="gallery-inline-edit">
+                                        <input
+                                            type="text"
+                                            class="gallery-inline-input"
+                                            data-inline-global-name="${photo.id}"
+                                            maxlength="80"
+                                            value="${escapeHtml(editName)}"
+                                            placeholder="Nombre de la foto"
+                                        >
+                                        <textarea
+                                            class="gallery-inline-textarea"
+                                            data-inline-global-description="${photo.id}"
+                                            maxlength="220"
+                                            placeholder="Descripcion (opcional)"
+                                        >${escapeHtml(editDescription)}</textarea>
+                                        <div class="gallery-inline-actions">
+                                            <button type="button" class="gallery-inline-save-btn" data-inline-global-save="${photo.id}">Guardar</button>
+                                            <button type="button" class="gallery-inline-cancel-btn" data-inline-global-cancel="${photo.id}">Cancelar</button>
+                                        </div>
+                                    </div>
+                                ` : `
+                                    <strong>${escapeHtml(photo.name || 'Foto')}</strong>
+                                    ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
+                                    <span>${escapeHtml(photo.addedAt || '')}</span>
+                                `}
                             </div>
                             ${canUpload ? `
                                 <div class="gallery-item-controls">
-                                    <button type="button" class="gallery-edit-btn" data-edit-global-photo="${photo.id}">Editar</button>
+                                    <button type="button" class="gallery-edit-btn" data-edit-global-photo="${photo.id}">${isEditing ? 'Editando' : 'Editar'}</button>
                                     <button type="button" class="gallery-remove-btn" data-remove-global-photo="${photo.id}">Eliminar</button>
                                 </div>
                             ` : ''}
                         </article>
-                    `).join('')
+                    `;
+                    }).join('')
                     : `
                         <div class="gallery-empty">
-                            <h4>No hay fotos aún</h4>
+                            <h4>No hay fotos aun</h4>
                             <p>Publica fotos para construir el muro tipo Pinterest.</p>
                         </div>
                     `
@@ -1889,8 +2489,7 @@ function bindGlobalGalleryPaneUi() {
             if (!ensureManualAuth('editar fotos')) {
                 return;
             }
-            const photoId = button.dataset.editGlobalPhoto;
-            editGlobalGalleryPhoto(photoId);
+            startInlinePhotoEdit('global', null, button.dataset.editGlobalPhoto);
         });
     });
 
@@ -1899,8 +2498,22 @@ function bindGlobalGalleryPaneUi() {
             if (!ensureManualAuth('eliminar fotos')) {
                 return;
             }
-            const photoId = button.dataset.removeGlobalPhoto;
-            removeGlobalGalleryPhoto(photoId);
+            removeGlobalGalleryPhoto(button.dataset.removeGlobalPhoto);
+        });
+    });
+
+    document.querySelectorAll('[data-inline-global-save]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('editar fotos')) {
+                return;
+            }
+            saveInlineGlobalPhotoEdit(button.dataset.inlineGlobalSave);
+        });
+    });
+
+    document.querySelectorAll('[data-inline-global-cancel]').forEach((button) => {
+        button.addEventListener('click', function() {
+            cancelInlinePhotoEdit();
         });
     });
 }
@@ -1917,35 +2530,84 @@ function appendPhotosToGlobalGallery(files) {
     });
 }
 
-function promptPhotoEdition(photo) {
-    if (!photo) return null;
+function isInlinePhotoEditing(scope, spotKey, photoId) {
+    if (!activeInlinePhotoEdit) {
+        return false;
+    }
 
-    const nextNameInput = window.prompt('Nombre de la foto', String(photo.name || ''));
-    if (nextNameInput === null) return null;
+    return (
+        activeInlinePhotoEdit.scope === scope &&
+        String(activeInlinePhotoEdit.photoId) === String(photoId) &&
+        (scope !== 'spot' || String(activeInlinePhotoEdit.spotKey || '') === String(spotKey || ''))
+    );
+}
 
-    const nextDescriptionInput = window.prompt('Descripcion de la foto', String(photo.description || ''));
-    if (nextDescriptionInput === null) return null;
+function startInlinePhotoEdit(scope, spotKey, photoId) {
+    if (!photoId) return;
 
-    return {
-        name: nextNameInput.trim() || 'Foto',
-        description: nextDescriptionInput.trim()
+    const sourcePhoto = scope === 'global'
+        ? globalGalleryPhotos.find((photo) => String(photo.id) === String(photoId))
+        : (galleryPhotosBySpot.get(String(spotKey || '')) || []).find((photo) => String(photo.id) === String(photoId));
+
+    if (!sourcePhoto) return;
+
+    activeInlinePhotoEdit = {
+        scope,
+        spotKey: scope === 'spot' ? String(spotKey || '') : '',
+        photoId: String(photoId),
+        name: String(sourcePhoto.name || 'Foto'),
+        description: String(sourcePhoto.description || '')
     };
+    renderThreads();
+}
+
+function cancelInlinePhotoEdit() {
+    if (!activeInlinePhotoEdit) {
+        return;
+    }
+    activeInlinePhotoEdit = null;
+    renderThreads();
+}
+
+function saveInlineGlobalPhotoEdit(photoId) {
+    if (!photoId) return;
+    const card = document.querySelector(`[data-global-photo-id="${photoId}"]`);
+    if (!card) return;
+
+    const nameInput = card.querySelector(`[data-inline-global-name="${photoId}"]`);
+    const descriptionInput = card.querySelector(`[data-inline-global-description="${photoId}"]`);
+    const edited = {
+        name: String(nameInput && nameInput.value ? nameInput.value : '').trim() || 'Foto',
+        description: String(descriptionInput && descriptionInput.value ? descriptionInput.value : '').trim()
+    };
+    editGlobalGalleryPhoto(photoId, edited);
+}
+
+function saveInlineSpotPhotoEdit(context, photoId) {
+    if (!context || !photoId) return;
+    const card = document.querySelector(`[data-spot-photo-id="${photoId}"]`);
+    if (!card) return;
+
+    const nameInput = card.querySelector(`[data-inline-spot-name="${photoId}"]`);
+    const descriptionInput = card.querySelector(`[data-inline-spot-description="${photoId}"]`);
+    const edited = {
+        name: String(nameInput && nameInput.value ? nameInput.value : '').trim() || 'Foto',
+        description: String(descriptionInput && descriptionInput.value ? descriptionInput.value : '').trim()
+    };
+    editSpotGalleryPhoto(context, photoId, edited);
 }
 
 function confirmPhotoDeletion(photoName) {
     const safeName = photoName ? `"${photoName}"` : 'esta foto';
-    window.alert(`Vas a eliminar ${safeName}.`);
+    notify(`Vas a eliminar ${safeName}.`, 'Confirmacion');
     return window.confirm(`Seguro que deseas eliminar ${safeName}? Esta accion no se puede deshacer.`);
 }
 
-function editGlobalGalleryPhoto(photoId) {
-    if (!photoId) return;
+function editGlobalGalleryPhoto(photoId, edited) {
+    if (!photoId || !edited) return;
 
     const index = globalGalleryPhotos.findIndex((photo) => String(photo.id) === String(photoId));
     if (index < 0) return;
-
-    const edited = promptPhotoEdition(globalGalleryPhotos[index]);
-    if (!edited) return;
 
     globalGalleryPhotos[index] = {
         ...globalGalleryPhotos[index],
@@ -1966,7 +2628,7 @@ function editGlobalGalleryPhoto(photoId) {
                 }
             });
     }
-    renderThreads();
+    cancelInlinePhotoEdit();
 }
 
 function removeGlobalGalleryPhoto(photoId) {
@@ -2031,8 +2693,10 @@ function handleMasonryResize() {
 function setNavMode(mode) {
     const home = document.getElementById('navHomeLink');
     const gallery = document.getElementById('navGalleryLink');
+    const drafts = document.getElementById('navDraftsLink');
     if (home) home.classList.toggle('active', mode === 'home');
     if (gallery) gallery.classList.toggle('active', mode === 'gallery');
+    if (drafts) drafts.classList.toggle('active', mode === 'drafts');
 }
 
 function focusEntriesBySpot(spotKey, spotName) {
@@ -2045,6 +2709,7 @@ function focusEntriesBySpot(spotKey, spotName) {
     activeGalleryContext = null;
     activeReadEntryId = null;
     activeGlobalGalleryMode = false;
+    activeDraftsMode = false;
 
     setNavMode('home');
     renderThreads();
@@ -2137,7 +2802,7 @@ function renderGalleryPane(feedContent, context) {
     const photos = galleryPhotosBySpot.get(context.spotKey) || [];
     const canUpload = isManualAuthenticated();
 
-    feedContent.innerHTML = `
+    feedContent.innerHTML =         `
         <section class="gallery-panel" aria-label="Galeria del spot">
             <header class="gallery-head">
                 <div>
@@ -2158,24 +2823,52 @@ function renderGalleryPane(feedContent, context) {
                 <button type="button" class="feed-tab ${context.view === 'list' ? 'active' : ''}" data-gallery-view="list">Lista</button>
             </div>
 
-            <div class="gallery-feed gallery-view-${context.view}">
+            <div class="gallery-feed gallery-view-${escapeHtml(context.view || 'pinterest')}">
                 ${photos.length
-                    ? photos.map((photo) => `
-                        <article class="gallery-item" data-photo-id="${photo.id}">
+                    ? photos.map((photo) => {
+                        const isEditing = isInlinePhotoEditing('spot', context.spotKey, photo.id);
+                        const editName = isEditing ? activeInlinePhotoEdit.name : String(photo.name || 'Foto');
+                        const editDescription = isEditing ? activeInlinePhotoEdit.description : String(photo.description || '');
+                        return `
+                        <article class="gallery-item ${isEditing ? 'is-inline-editing' : ''}" data-spot-photo-id="${photo.id}">
                             <img src="${photo.src}" alt="${escapeHtml(photo.name || 'Foto de galeria')}">
                             <div class="gallery-item-meta">
-                                <strong>${escapeHtml(photo.name || 'Foto')}</strong>
-                                ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
-                                <span>${escapeHtml(photo.addedAt || '')}</span>
+                                ${isEditing ? `
+                                    <div class="gallery-inline-edit">
+                                        <input
+                                            type="text"
+                                            class="gallery-inline-input"
+                                            data-inline-spot-name="${photo.id}"
+                                            maxlength="80"
+                                            value="${escapeHtml(editName)}"
+                                            placeholder="Nombre de la foto"
+                                        >
+                                        <textarea
+                                            class="gallery-inline-textarea"
+                                            data-inline-spot-description="${photo.id}"
+                                            maxlength="220"
+                                            placeholder="Descripcion (opcional)"
+                                        >${escapeHtml(editDescription)}</textarea>
+                                        <div class="gallery-inline-actions">
+                                            <button type="button" class="gallery-inline-save-btn" data-inline-spot-save="${photo.id}">Guardar</button>
+                                            <button type="button" class="gallery-inline-cancel-btn" data-inline-spot-cancel="${photo.id}">Cancelar</button>
+                                        </div>
+                                    </div>
+                                ` : `
+                                    <strong>${escapeHtml(photo.name || 'Foto')}</strong>
+                                    ${photo.description ? `<p class="gallery-photo-description">${escapeHtml(photo.description)}</p>` : ''}
+                                    <span>${escapeHtml(photo.addedAt || '')}</span>
+                                `}
                             </div>
                             ${canUpload ? `
                                 <div class="gallery-item-controls">
-                                    <button type="button" class="gallery-edit-btn" data-edit-spot-photo="${photo.id}">Editar</button>
+                                    <button type="button" class="gallery-edit-btn" data-edit-spot-photo="${photo.id}">${isEditing ? 'Editando' : 'Editar'}</button>
                                     <button type="button" class="gallery-remove-btn" data-remove-spot-photo="${photo.id}">Eliminar</button>
                                 </div>
                             ` : ''}
                         </article>
-                    `).join('')
+                    `;
+                    }).join('')
                     : `
                         <div class="gallery-empty">
                             <h4>Tu galeria aun esta vacia</h4>
@@ -2231,7 +2924,7 @@ function bindGalleryPaneUi(context) {
             if (!ensureManualAuth('editar fotos')) {
                 return;
             }
-            editSpotGalleryPhoto(context, button.dataset.editSpotPhoto);
+            startInlinePhotoEdit('spot', context.spotKey, button.dataset.editSpotPhoto);
         });
     });
 
@@ -2241,6 +2934,21 @@ function bindGalleryPaneUi(context) {
                 return;
             }
             removeSpotGalleryPhoto(context, button.dataset.removeSpotPhoto);
+        });
+    });
+
+    document.querySelectorAll('[data-inline-spot-save]').forEach((button) => {
+        button.addEventListener('click', function() {
+            if (!ensureManualAuth('editar fotos')) {
+                return;
+            }
+            saveInlineSpotPhotoEdit(context, button.dataset.inlineSpotSave);
+        });
+    });
+
+    document.querySelectorAll('[data-inline-spot-cancel]').forEach((button) => {
+        button.addEventListener('click', function() {
+            cancelInlinePhotoEdit();
         });
     });
 }
@@ -2265,15 +2973,12 @@ function appendPhotosToGallery(context, files) {
     });
 }
 
-function editSpotGalleryPhoto(context, photoId) {
-    if (!context || !photoId) return;
+function editSpotGalleryPhoto(context, photoId, edited) {
+    if (!context || !photoId || !edited) return;
 
     const current = galleryPhotosBySpot.get(context.spotKey) || [];
     const index = current.findIndex((photo) => String(photo.id) === String(photoId));
     if (index < 0) return;
-
-    const edited = promptPhotoEdition(current[index]);
-    if (!edited) return;
 
     const next = [...current];
     next[index] = {
@@ -2296,7 +3001,7 @@ function editSpotGalleryPhoto(context, photoId) {
                 }
             });
     }
-    renderThreads();
+    cancelInlinePhotoEdit();
 }
 
 function removeSpotGalleryPhoto(context, photoId) {
@@ -2316,14 +3021,24 @@ function removeSpotGalleryPhoto(context, photoId) {
     });
 }
 
-function getEntryDraftKey(context) {
-    if (context && context.mode === 'edit' && context.entryId) {
-        return `entry:${String(context.entryId)}`;
+function getEntryDraftKey(context, ownerKey = getDraftOwnerKey()) {
+    if (context && context.draftKey) {
+        return String(context.draftKey);
     }
-    return `spot:${String(context && context.spotKey ? context.spotKey : 'draft')}`;
+    if (context && context.mode === 'edit' && context.entryId) {
+        return `${ownerKey}::entry:${String(context.entryId)}`;
+    }
+    return `${ownerKey}::spot:${String(context && context.spotKey ? context.spotKey : 'draft')}`;
 }
 
 function getInitialEntryDraft(context) {
+    if (context && context.forceNew) {
+        return {
+            title: '',
+            content: ''
+        };
+    }
+
     const draftKey = getEntryDraftKey(context);
     const savedDraft = entryDraftsBySpot.get(draftKey);
     if (savedDraft) {
@@ -2351,11 +3066,11 @@ function getInitialEntryDraft(context) {
         content: ''
     };
 }
-
 function renderEntryComposer(feedContent, context) {
     const isEditingEntry = Boolean(context && context.mode === 'edit' && context.entryId);
     const draft = getInitialEntryDraft(context);
     const canPublish = isManualAuthenticated();
+    const canSaveDraft = isManualAuthenticated();
     const closeLabel = isEditingEntry ? 'Cancelar edicion' : 'Descartar entrada';
     const publishLabel = isEditingEntry ? 'Guardar cambios' : 'Publicar';
     const publishTitle = canPublish
@@ -2371,47 +3086,54 @@ function renderEntryComposer(feedContent, context) {
                 </div>
                 <div class="entry-editor-actions">
                     <button class="ghost-btn" type="button" id="closeComposerBtn">${closeLabel}</button>
-                    <button class="ghost-btn" type="button" id="saveDraftBtn">Guardar borrador</button>
+                    <button class="ghost-btn" type="button" id="saveDraftBtn" ${canSaveDraft ? '' : 'disabled'} title="${canSaveDraft ? 'Guardar borrador' : 'Inicia sesion para guardar borradores'}">Guardar borrador</button>
                     <button class="primary-btn" type="button" id="publishEntryBtn" ${canPublish ? '' : 'disabled'} title="${publishTitle}">${publishLabel}</button>
                 </div>
             </header>
 
             <div class="doc-toolbar" role="toolbar" aria-label="Formato del texto">
-                <button type="button" class="doc-tool" data-command="undo" title="Deshacer">↶</button>
-                <button type="button" class="doc-tool" data-command="redo" title="Rehacer">↷</button>
-                <button type="button" class="doc-tool" data-command="bold"><strong>B</strong></button>
-                <button type="button" class="doc-tool" data-command="italic"><em>I</em></button>
-                <button type="button" class="doc-tool" data-command="underline"><u>U</u></button>
-                <select class="doc-select" id="blockFormatSelect" aria-label="Tipo de bloque">
-                    <option value="p">Parrafo</option>
-                    <option value="h1">H1</option>
-                    <option value="h2">H2</option>
-                    <option value="h3">H3</option>
-                    <option value="blockquote">Cita</option>
-                </select>
-                <button type="button" class="doc-tool" data-command="formatBlock" data-value="blockquote">"</button>
-                <button type="button" class="doc-tool" data-command="insertUnorderedList">Lista</button>
-                <button type="button" class="doc-tool" data-command="insertOrderedList">1.</button>
-                <button type="button" class="doc-tool" data-command="justifyLeft" title="Alinear izquierda">Izq</button>
-                <button type="button" class="doc-tool" data-command="justifyCenter" title="Alinear centro">Centro</button>
-                <button type="button" class="doc-tool" data-command="justifyRight" title="Alinear derecha">Der</button>
-                <button type="button" class="doc-tool" data-command="justifyFull" title="Justificar">Just</button>
-                <button type="button" class="doc-tool" data-action="checklist">Checklist</button>
-                <label class="doc-color-control" title="Color de texto">
-                    <span>A</span>
-                    <input type="color" id="textColorPicker" value="#171717" aria-label="Color de texto">
-                </label>
-                <label class="doc-color-control" title="Resaltado">
-                    <span>Res</span>
-                    <input type="color" id="highlightColorPicker" value="#fff2a8" aria-label="Color de resaltado">
-                </label>
-                <button type="button" class="doc-tool" data-command="createLink" data-needs-url="true">Link</button>
-                <button type="button" class="doc-tool" data-action="insert-image">Imagen</button>
-                <button type="button" class="doc-tool" data-action="insert-table">Tabla</button>
-                <button type="button" class="doc-tool" data-command="insertHorizontalRule">---</button>
-                <button type="button" class="doc-tool" data-action="copy-format">Copiar formato</button>
-                <button type="button" class="doc-tool" data-command="removeFormat">Limpiar</button>
-                <span class="doc-word-count" id="docWordCount">0 palabras</span>
+                <div class="doc-tool-group" aria-label="Formato">
+                    <button type="button" class="doc-tool" data-command="bold"><strong>B</strong></button>
+                    <button type="button" class="doc-tool" data-command="italic"><em>I</em></button>
+                    <button type="button" class="doc-tool" data-command="underline"><u>U</u></button>
+                    <label class="doc-color-control" title="Color de texto">
+                        <span>A</span>
+                        <input type="color" id="textColorPicker" value="#171717" aria-label="Color de texto">
+                    </label>
+                    <label class="doc-color-control" title="Resaltado">
+                        <span>Res</span>
+                        <input type="color" id="highlightColorPicker" value="#fff2a8" aria-label="Color de resaltado">
+                    </label>
+                </div>
+
+                <div class="doc-tool-group" aria-label="Bloques">
+                    <select class="doc-select" id="fontSizeSelect" aria-label="Tamano de fuente">
+                        <option value="2">12px</option>
+                        <option value="3" selected>16px</option>
+                        <option value="4">18px</option>
+                        <option value="5">24px</option>
+                        <option value="6">32px</option>
+                    </select>
+                    <button type="button" class="doc-tool" data-command="formatBlock" data-value="blockquote">"</button>
+                    <button type="button" class="doc-tool" data-command="insertUnorderedList">Lista</button>
+                    <button type="button" class="doc-tool" data-command="insertOrderedList">1.</button>
+                </div>
+
+                <div class="doc-tool-group" aria-label="Alineacion">
+                    <button type="button" class="doc-tool" data-command="justifyLeft" title="Alinear izquierda">Izq</button>
+                    <button type="button" class="doc-tool" data-command="justifyCenter" title="Alinear centro">Ctr</button>
+                    <button type="button" class="doc-tool" data-command="justifyRight" title="Alinear derecha">Der</button>
+                    <button type="button" class="doc-tool" data-command="justifyFull" title="Justificar">Jst</button>
+                </div>
+
+                <div class="doc-tool-group" aria-label="Inserciones">
+                    <button type="button" class="doc-tool" data-action="checklist">Checklist</button>
+                    <button type="button" class="doc-tool" data-command="createLink" data-needs-url="true">Link</button>
+                    <button type="button" class="doc-tool" data-action="insert-image">Imagen</button>
+                    <button type="button" class="doc-tool" data-action="insert-table">Tabla</button>
+                    <button type="button" class="doc-tool" data-command="insertHorizontalRule">---</button>
+                </div>
+
             </div>
 
             <div class="doc-workspace">
@@ -2429,7 +3151,8 @@ function renderEntryComposer(feedContent, context) {
                     contenteditable="true"
                     spellcheck="true"
                     aria-label="Contenido de la entrada"
-                >${draft.content || '<p>Empieza a escribir aqui tu cronica...</p>'}</article>
+                >${draft.content || ''}</article>
+                <div class="doc-word-count" id="docWordCount">0 palabras | 0 caracteres</div>
             </div>
         </section>
     `;
@@ -2447,15 +3170,13 @@ function bindEntryComposerUi(context) {
     const editor = document.getElementById('entryBodyEditor');
     const toolbar = document.querySelector('.doc-toolbar');
     const wordCountNode = document.getElementById('docWordCount');
-    const blockFormatSelect = document.getElementById('blockFormatSelect');
+    const fontSizeSelect = document.getElementById('fontSizeSelect');
     const textColorPicker = document.getElementById('textColorPicker');
     const highlightColorPicker = document.getElementById('highlightColorPicker');
-    let copiedFormatState = null;
-    let painterArmed = false;
 
     if (closeBtn) {
         closeBtn.addEventListener('click', function() {
-            entryDraftsBySpot.delete(draftKey);
+            void removeEntryDraft(context, draftKey);
             if (isEditingEntry) {
                 openEntryReader(context.entryId);
                 return;
@@ -2465,12 +3186,20 @@ function bindEntryComposerUi(context) {
     }
 
     if (saveDraftBtn) {
-        saveDraftBtn.addEventListener('click', function() {
-            saveEntryDraft(context, titleInput, editor);
-            saveDraftBtn.textContent = 'Guardado';
-            window.setTimeout(() => {
-                saveDraftBtn.textContent = 'Guardar borrador';
-            }, 1200);
+        saveDraftBtn.addEventListener('click', async function() {
+            if (!ensureManualAuth('guardar borradores')) {
+                return;
+            }
+            saveDraftBtn.disabled = true;
+            saveDraftBtn.textContent = 'Guardando...';
+            const saved = await saveEntryDraft(context, titleInput, editor);
+            saveDraftBtn.disabled = false;
+            saveDraftBtn.textContent = saved.persistedRemotely ? 'Guardado' : 'Guardado local';
+            if (isEditingEntry) {
+                openEntryReader(context.entryId);
+                return;
+            }
+            closeEntryComposer();
         });
     }
 
@@ -2490,7 +3219,7 @@ function bindEntryComposerUi(context) {
             if (!published) {
                 return;
             }
-            entryDraftsBySpot.delete(draftKey);
+            await removeEntryDraft(context, draftKey);
             if (isEditingEntry) {
                 openEntryReader(context.entryId);
                 return;
@@ -2499,11 +3228,11 @@ function bindEntryComposerUi(context) {
         });
     }
 
-    if (blockFormatSelect && editor) {
-        blockFormatSelect.addEventListener('change', function() {
+    if (fontSizeSelect && editor) {
+        fontSizeSelect.addEventListener('change', function() {
             editor.focus();
-            document.execCommand('formatBlock', false, blockFormatSelect.value);
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            document.execCommand('fontSize', false, fontSizeSelect.value);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
     }
 
@@ -2512,7 +3241,7 @@ function bindEntryComposerUi(context) {
             editor.focus();
             document.execCommand('styleWithCSS', false, true);
             document.execCommand('foreColor', false, textColorPicker.value);
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
     }
 
@@ -2521,7 +3250,7 @@ function bindEntryComposerUi(context) {
             editor.focus();
             document.execCommand('styleWithCSS', false, true);
             document.execCommand('hiliteColor', false, highlightColorPicker.value);
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
     }
 
@@ -2543,13 +3272,9 @@ function bindEntryComposerUi(context) {
                     }
                 } else if (action === 'insert-table') {
                     insertSimpleTable(editor);
-                } else if (action === 'copy-format') {
-                    copiedFormatState = captureCurrentFormat(editor);
-                    painterArmed = Boolean(copiedFormatState);
-                    actionButton.classList.toggle('is-active', painterArmed);
                 }
 
-                refreshToolbarState(editor, toolbar, blockFormatSelect);
+                refreshToolbarState(editor, toolbar, fontSizeSelect);
                 updateWordCount(editor, wordCountNode);
                 return;
             }
@@ -2565,12 +3290,12 @@ function bindEntryComposerUi(context) {
                 if (url) {
                     document.execCommand(command, false, url.trim());
                 }
-                refreshToolbarState(editor, toolbar, blockFormatSelect);
+                refreshToolbarState(editor, toolbar, fontSizeSelect);
                 return;
             }
 
             document.execCommand(command, false, value);
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
             updateWordCount(editor, wordCountNode);
         });
     }
@@ -2578,48 +3303,66 @@ function bindEntryComposerUi(context) {
     if (editor) {
         editor.addEventListener('input', function() {
             updateWordCount(editor, wordCountNode);
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
 
         editor.addEventListener('keyup', function() {
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
 
         editor.addEventListener('mouseup', function() {
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
-            if (!painterArmed || !copiedFormatState) {
-                return;
-            }
-
-            const selection = window.getSelection();
-            if (!selection || selection.isCollapsed) {
-                return;
-            }
-
-            applyFormatState(copiedFormatState);
-            painterArmed = false;
-            copiedFormatState = null;
-            const copyButton = toolbar ? toolbar.querySelector('[data-action="copy-format"]') : null;
-            if (copyButton) {
-                copyButton.classList.remove('is-active');
-            }
-            refreshToolbarState(editor, toolbar, blockFormatSelect);
-            updateWordCount(editor, wordCountNode);
+            refreshToolbarState(editor, toolbar, fontSizeSelect);
         });
     }
 
     updateWordCount(editor, wordCountNode);
-    refreshToolbarState(editor, toolbar, blockFormatSelect);
+    refreshToolbarState(editor, toolbar, fontSizeSelect);
 }
 
-function saveEntryDraft(context, titleInput, editor) {
-    if (!context || !titleInput || !editor) return;
+async function saveEntryDraft(context, titleInput, editor) {
+    if (!context || !titleInput || !editor) {
+        return {
+            persistedRemotely: false
+        };
+    }
+    if (!isManualAuthenticated()) {
+        return {
+            persistedRemotely: false
+        };
+    }
     const draftKey = getEntryDraftKey(context);
 
-    entryDraftsBySpot.set(draftKey, {
+    const draftValue = {
         title: titleInput.value.trim(),
-        content: editor.innerHTML.trim()
-    });
+        content: editor.innerHTML.trim(),
+        spotKey: String(context.spotKey || 'draft'),
+        spotName: String(context.spotName || 'Spot'),
+        owner: getDraftOwnerName(),
+        ownerKey: getDraftOwnerKey(),
+        mode: context.mode === 'edit' ? 'edit' : 'compose',
+        entryId: context.entryId ? String(context.entryId) : null,
+        updatedAt: new Date().toISOString()
+    };
+    entryDraftsBySpot.set(draftKey, draftValue);
+    persistEntryDraftsToStorage();
+    const persistedRemotely = await upsertEntryDraftToSupabase(draftKey, draftValue);
+    if (activeDraftsMode) {
+        renderThreads();
+    }
+    return {
+        persistedRemotely
+    };
+}
+
+async function removeEntryDraft(context, draftKey = getEntryDraftKey(context)) {
+    const existingDraft = entryDraftsBySpot.get(draftKey);
+    entryDraftsBySpot.delete(draftKey);
+    persistEntryDraftsToStorage();
+
+    const ownerKey = existingDraft && existingDraft.ownerKey
+        ? String(existingDraft.ownerKey)
+        : getDraftOwnerKey();
+    await deleteEntryDraftFromSupabase(draftKey, ownerKey);
 }
 
 async function publishEntry(context, titleInput, editor) {
@@ -2642,7 +3385,7 @@ async function publishEntry(context, titleInput, editor) {
     if (isEditingEntry) {
         const entryIndex = publishedEntries.findIndex((item) => String(item.id) === String(context.entryId));
         if (entryIndex < 0) {
-            window.alert('No se encontro la entrada para editar.');
+            notify('No se encontro la entrada para editar.', 'Edicion');
             return false;
         }
 
@@ -2659,7 +3402,7 @@ async function publishEntry(context, titleInput, editor) {
 
             if (error) {
                 logSupabaseError('No se pudo editar la entrada', error);
-                window.alert('No se pudo guardar la edicion en Supabase.');
+                notify('No se pudo guardar la edicion en Supabase.', 'Error al guardar');
                 return false;
             }
         }
@@ -2710,8 +3453,6 @@ async function publishEntry(context, titleInput, editor) {
     }
 
     publishedEntries.unshift(entryForFeed);
-
-    saveEntryDraft(context, titleInput, editor);
     renderHomeEntriesFeed();
     return true;
 }
@@ -2719,14 +3460,30 @@ async function publishEntry(context, titleInput, editor) {
 function renderHomeEntriesFeed() {
     const container = document.getElementById('homeEntriesFeed');
     const counter = document.getElementById('homeEntriesCount');
+    const searchInput = document.getElementById('entriesSearchInput');
     if (!container) return;
+    if (searchInput && searchInput.value !== activeEntriesSearchQuery) {
+        searchInput.value = activeEntriesSearchQuery;
+    }
 
-    const filteredEntries = activeEntriesSpotFilter
+    const filteredBySpot = activeEntriesSpotFilter
         ? publishedEntries.filter((entry) => String(entry.spotKey) === activeEntriesSpotFilter.spotKey)
         : publishedEntries;
+    const normalizedQuery = String(activeEntriesSearchQuery || '').trim().toLowerCase();
+    const filteredEntries = normalizedQuery
+        ? filteredBySpot.filter((entry) => {
+            const haystack = [
+                entry.title,
+                entry.excerpt,
+                entry.spotName,
+                entry.createdBy
+            ].map((value) => String(value || '').toLowerCase()).join(' ');
+            return haystack.includes(normalizedQuery);
+        })
+        : filteredBySpot;
 
     if (counter) {
-        counter.textContent = activeEntriesSpotFilter
+        counter.textContent = (activeEntriesSpotFilter || normalizedQuery)
             ? `${filteredEntries.length} de ${publishedEntries.length} publicadas`
             : `${publishedEntries.length} publicadas`;
     }
@@ -2738,14 +3495,14 @@ function renderHomeEntriesFeed() {
                 <button class="ghost-btn" type="button" id="clearEntriesFilterBtn">Mostrar todas</button>
             </article>
         `
-        : '';
+        : ''
 
     if (!filteredEntries.length) {
         container.innerHTML = `
             ${filterBanner}
             <article class="home-entry-empty">
-                <h4>${activeEntriesSpotFilter ? 'No hay entradas en este spot' : 'Aun no hay entradas publicadas'}</h4>
-                <p>${activeEntriesSpotFilter ? 'Quita el filtro para ver todas las entradas o publica una nueva en este spot.' : 'Publica tu primera historia y aparecera aqui, con lo mas reciente siempre arriba.'}</p>
+                <h4>${activeEntriesSpotFilter || normalizedQuery ? 'No hay coincidencias' : 'Aun no hay entradas publicadas'}</h4>
+                <p>${activeEntriesSpotFilter || normalizedQuery ? 'Prueba con otro termino o quita los filtros para ver mas entradas.' : 'Publica tu primera historia y aparecera aqui, con lo mas reciente siempre arriba.'}</p>
             </article>
         `;
 
@@ -2839,12 +3596,14 @@ function updateWordCount(editor, wordCountNode) {
     if (!editor || !wordCountNode) return;
 
     const text = editor.innerText || '';
-    const words = text.trim().match(/\S+/g);
-    const count = words ? words.length : 0;
-    wordCountNode.textContent = `${count} palabra${count === 1 ? '' : 's'}`;
+    const normalized = text.trim();
+    const words = normalized.match(/\S+/g);
+    const wordCount = words ? words.length : 0;
+    const charCount = normalized.length;
+    wordCountNode.textContent = `${wordCount} palabra${wordCount === 1 ? '' : 's'} | ${charCount} caracter${charCount === 1 ? '' : 'es'}`;
 }
 
-function refreshToolbarState(editor, toolbar, blockFormatSelect) {
+function refreshToolbarState(editor, toolbar, fontSizeSelect) {
     if (!editor || !toolbar) return;
 
     const toggleCommands = ['bold', 'italic', 'underline', 'insertUnorderedList', 'insertOrderedList', 'justifyLeft', 'justifyCenter', 'justifyRight', 'justifyFull'];
@@ -2855,12 +3614,20 @@ function refreshToolbarState(editor, toolbar, blockFormatSelect) {
         button.classList.toggle('is-active', Boolean(isActive));
     });
 
-    if (blockFormatSelect) {
-        const currentBlock = normalizeBlockValue(document.queryCommandValue('formatBlock'));
-        if (currentBlock) {
-            blockFormatSelect.value = currentBlock;
+    if (fontSizeSelect) {
+        const currentFontSize = normalizeFontSizeValue(document.queryCommandValue('fontSize'));
+        if (currentFontSize) {
+            fontSizeSelect.value = currentFontSize;
         }
     }
+}
+
+function normalizeFontSizeValue(rawValue) {
+    const normalized = String(rawValue || '').trim();
+    if (['1', '2', '3', '4', '5', '6', '7'].includes(normalized)) {
+        return normalized;
+    }
+    return '3';
 }
 
 function normalizeBlockValue(rawValue) {
@@ -2996,7 +3763,7 @@ function renderMarkers() {
             })
         })
             .bindPopup(
-                `<strong>${thread.title}</strong><br>${thread.area} · ${category.label}`,
+                `<strong>${thread.title}</strong><br>${thread.area} Â· ${category.label}`,
                 { className: 'artist-popup', maxWidth: 260 }
             )
             .addTo(map);
@@ -3028,6 +3795,11 @@ function focusThread(threadId) {
 }
 
 window.addEventListener('DOMContentLoaded', initMap);
+
+
+
+
+
 
 
 
